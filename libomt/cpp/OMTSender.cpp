@@ -10,6 +10,7 @@
 // than repeating the numbers, so the sender's gate and VMX_Create() cannot drift apart.
 #include "../../libvmx/src/vmxcodec_common.h"
 
+#include <cmath>     // std::isfinite: an aspect ratio that is NaN/Inf/0 is a header nobody can render
 #include <cstring>
 #include <algorithm>
 #include <arpa/inet.h>
@@ -329,11 +330,23 @@ size_t Sender::encodeBufferCapacity(int width, int height) {
 // returned NULL, so acceptLoop() sized every later subscriber's pool from a frame that does not
 // exist, and the failure surfaced as the generic "encoder produced no payload" — the one line an
 // operator needed was the one that was missing.
+//
+// The key is (width, height, colour space). Colour space was missing from it: the reuse test below
+// compared only the two dimensions, while the value passed to VMX_Create() at the bottom of this
+// function decides which RGB<->YUV table the codec uses (vmxcodec.cpp:1448/1466/1654/1673 select
+// RGB_YUV_601 off instance->ColorSpace). A same-size 601->709 transition therefore kept encoding
+// BGRA with the 601 matrix, and send() stamped 709 into VideoExtHeader::colorSpace for every
+// subscriber on the link. Measured on host, qa/encoder-reconfiguration.cpp SA6/SA7: the frame
+// advertised as 709 carried the 717-byte payload of a continued 601 encoder, byte for byte, where a
+// genuine 709 encoder produces 621. Profile is not in this key because every path that changes
+// currentProfile_ (setQuality, onQualityChanged, checkCongestion) calls destroyEncoder() with it.
 bool Sender::createEncoder(int width, int height, int frameRate, int colorSpace, std::string& why) {
     std::lock_guard<std::mutex> lock(encoderMutex_);
 
-    if (vmxInstance_ && currentWidth_ == width && currentHeight_ == height) {
-        return true;  // Already have correct encoder. Recreated via destroyEncoder() if profile changed.
+    if (vmxInstance_ && currentWidth_ == width && currentHeight_ == height &&
+        currentColorSpace_ == colorSpace) {
+        return true;  // Already have the encoder for this descriptor. Recreated via destroyEncoder()
+                      // if the profile changed, and re-created here if the colour space did.
     }
 
     destroyEncoder();
@@ -355,10 +368,14 @@ bool Sender::createEncoder(int width, int height, int frameRate, int colorSpace,
 
     currentWidth_ = width;
     currentHeight_ = height;
+    // Published with the instance, and cleared with it: this is the value send() is allowed to put
+    // on the wire, so it has to mean "the encoder that exists was created as X" and nothing else.
+    currentColorSpace_ = colorSpace;
 
     encodeBuffer_.resize(encodeBufferCapacity(width, height));
 
-    LOGI("Encoder created: %dx%d, profile=%d", width, height, static_cast<int>(currentProfile_));
+    LOGI("Encoder created: %dx%d, colorspace=%d, profile=%d", width, height, colorSpace,
+         static_cast<int>(currentProfile_));
     return true;
 }
 
@@ -369,12 +386,40 @@ void Sender::destroyEncoder() {
     }
     currentWidth_ = 0;
     currentHeight_ = 0;
+    currentColorSpace_ = -1;   // -1, not 0: 0 is a real colour space (Undefined). See OMTSender.h.
 }
 
-int Sender::encodeFrame(const MediaFrame& frame) {
+EncoderIdentity Sender::encoderIdentity() const {
     std::lock_guard<std::mutex> lock(encoderMutex_);
-    
+    EncoderIdentity e;
+    if (vmxInstance_) {
+        e.width = currentWidth_;
+        e.height = currentHeight_;
+        e.colorSpace = currentColorSpace_;
+        e.profile = currentProfile_;
+        e.valid = true;
+    }
+    return e;
+}
+
+int Sender::encodeFrame(const MediaFrame& frame, EncoderIdentity* used) {
+    std::lock_guard<std::mutex> lock(encoderMutex_);
+
+    if (used) *used = EncoderIdentity{};   // cleared first: a refused encode declares nothing
     if (!vmxInstance_) return 0;
+
+    // Which instance is about to make these bytes, captured under the same lock as the encode. send()
+    // derives the declaration from this rather than from the caller's MediaFrame, so what a receiver
+    // is told can only ever be what the codec was configured as. If the instance disappears under us
+    // (a concurrent quality change) this stays invalid and the frame is refused instead of declared.
+    if (used) {
+        used->width = currentWidth_;
+        used->height = currentHeight_;
+        used->colorSpace = currentColorSpace_;
+        used->profile = currentProfile_;
+        used->valid = (currentWidth_ == frame.width && currentHeight_ == frame.height &&
+                       currentColorSpace_ == frame.colorSpace);
+    }
     
     int interlaced = (frame.flags & VideoFlags::Interlaced) ? 1 : 0;
     VMX_ERR err = VMX_ERR_UNKNOWN;
@@ -436,6 +481,87 @@ int Sender::encodeFrame(const MediaFrame& frame) {
 // suite must go red.
 bool Sender::encodedLenAcceptable(int encodedLen, size_t capacity) {
     return encodedLen > 0 && static_cast<size_t>(encodedLen) <= capacity;
+}
+
+// The flag numbers above are the wire. Pin them the same way the colour numbering below is pinned:
+// a silent renumbering must be a compile error, not a flag OBS reads as something else. The
+// authority is libomt.h:135-144; qa/wire-declaration.cpp asserts the same equalities against that
+// header at runtime, because a constant in this file cannot notice the C enum moving.
+static_assert(VideoFlags::Interlaced == 1 && VideoFlags::Alpha == 2 &&
+              VideoFlags::PreMultiplied == 4 && VideoFlags::Preview == 8 &&
+              VideoFlags::HighBitDepth == 16,
+              "VideoExtHeader::flags must use the OMTVideoFlags numbering (1/2/4/8/16)");
+
+// VMX_ConfigureInterlaced (libvmx/src/vmxcodec.cpp:501-510) sets VMX_FORMAT_INTERLACED for these
+// heights only — they are the ones divisible by slice height * 2, 1080 by virtue of aligning to
+// 1088. At any other height the codec stays PROGRESSIVE whatever the caller asked for, so an
+// Interlaced header there would describe a field order the payload has not got. Kept as its own
+// predicate so the suite can mutate it on its own (qa/build-host.sh: dg-mutant-interlace-heights).
+bool Sender::interlacedHeightSupported(int height) {
+    return height == 480 || height == 576 || height == 1080;
+}
+
+// The only place the two wire headers are assembled, and the only place their colour space, width
+// and height may be read: from the ENCODER IDENTITY, i.e. from the instance that produced the
+// payload — never from the caller's MediaFrame. send() hands it the identity encodeFrame() captured
+// under encoderMutex_, so a header can no longer claim a matrix, or a size, that the encoder behind
+// these bytes was not created with.
+//
+// A disagreement between the two is refused rather than quietly repaired: the caller asked to put
+// something on the wire that the payload does not support, and the desktop's lying-Alpha incident
+// is the record of what happens when a sender chooses "keep streaming" over "refuse" here. The
+// normal path cannot reach the refusal once the reuse key includes colour space — that is what
+// makes it a tripwire rather than a branch, and why qa/wire-declaration.cpp drives this function
+// directly with a contradictory pair instead of hoping the live path produces one.
+bool Sender::buildVideoHeaders(const MediaFrame& frame, const EncoderIdentity& encoder,
+                              int encodedLen, FrameHeader& outHeader, VideoExtHeader& outExt,
+                              std::string& why) {
+    auto reject = [&why](const std::string& reason) {
+        why = "wire declaration refused: " + reason;
+        return false;
+    };
+
+    if (!encoder.valid)
+        return reject("no encoder was captured as the producer of this payload");
+    if (encodedLen <= 0)
+        return reject("there is no payload to declare (" + std::to_string(encodedLen) + " bytes)");
+    if (encoder.width != frame.width || encoder.height != frame.height)
+        return reject("the frame is " + std::to_string(frame.width) + "x" + std::to_string(frame.height) +
+                      " but the encoder that produced these " + std::to_string(encodedLen) +
+                      " bytes is " + std::to_string(encoder.width) + "x" + std::to_string(encoder.height));
+    if (encoder.colorSpace != frame.colorSpace)
+        return reject("the frame claims colour space " + std::to_string(frame.colorSpace) +
+                      " but the encoder that produced these bytes was created as " +
+                      std::to_string(encoder.colorSpace) +
+                      " — advertising the claim would put a header on the link that lies about the payload");
+    // Belt, on the value that actually reaches the wire: even a caller that assembled an identity by
+    // hand cannot publish a matrix the codec does not implement.
+    if (encoder.colorSpace != ColorSpace::Undefined &&
+        encoder.colorSpace != ColorSpace::BT601 &&
+        encoder.colorSpace != ColorSpace::BT709)
+        return reject("the encoder reports colour space " + std::to_string(encoder.colorSpace) +
+                      ", which is not one of the wire values 0/601/709");
+
+    FrameHeader header{};
+    header.version = 1;
+    header.frameType = static_cast<uint8_t>(FrameType::Video);
+    header.timestamp = frame.timestamp;
+    header.metadataLength = 0;
+    header.dataLength = VideoExtHeader::SIZE + encodedLen;
+
+    VideoExtHeader ext{};
+    ext.codec = Codec::VMX1;
+    ext.width = encoder.width;              // from the encoder, not from the frame
+    ext.height = encoder.height;
+    ext.frameRateN = frame.frameRateN;
+    ext.frameRateD = frame.frameRateD;
+    ext.aspectRatio = frame.aspectRatio;    // validated as a declaration by validateFrame()
+    ext.flags = frame.flags;                // ditto: only claims the payload can carry survive that gate
+    ext.colorSpace = encoder.colorSpace;    // THE declaration: what made these bytes
+
+    outHeader = header;
+    outExt = ext;
+    return true;
 }
 
 // The wire carries these numbers to every receiver in the ecosystem, and this project has
@@ -575,6 +701,46 @@ bool Sender::validateFrame(const MediaFrame& frame, std::string& why) {
         return reject("unsupported colorspace " + std::to_string(frame.colorSpace) +
                       " (VMX encodes 601/709 only; the wire cannot carry a claim the payload does not match)");
     }
+
+    // ---- the rest of what VideoExtHeader promises, additively ------------------------------------
+    // Everything below joins the colour-space gate rather than replacing it: `flags` and
+    // `aspectRatio` are published verbatim (buildVideoHeaders() takes them straight from the frame),
+    // so an unsupported claim here reaches OBS exactly as a wrong matrix would. This is the family
+    // the desktop's lying-Alpha incident belongs to, and the reason the checks sit here instead of
+    // at the socket is the reason the colour gate already does: this runs BEFORE the no-clients
+    // shortcut, so a frame that would have lied on air is refused while nobody is watching.
+    const int32_t knownFlags = VideoFlags::Interlaced | VideoFlags::Alpha | VideoFlags::PreMultiplied |
+                               VideoFlags::Preview | VideoFlags::HighBitDepth;
+    if (frame.flags & ~knownFlags) {
+        char hex[12];
+        std::snprintf(hex, sizeof(hex), "0x%X", static_cast<unsigned>(frame.flags & ~knownFlags));
+        return reject(std::string("undefined video flag bits ") + hex +
+                      " (OMTVideoFlags defines 1/2/4/8/16; a receiver cannot be told about a bit that "
+                      "means nothing on either side)");
+    }
+    // Every input this sender encodes is 8-bit: BGRA/UYVY/YUY2/NV12. The codec's 16-bit formats
+    // (P216/PA16) have no fourCC here and no entry in encodeFrame()'s switch, so no payload this
+    // class can produce is high bit depth and the flag would be pure invention.
+    if (frame.flags & VideoFlags::HighBitDepth)
+        return reject("HighBitDepth claimed on an " + std::string(codecName(frame.codec)) +
+                      " frame (this sender encodes 8-bit inputs only — P216/PA16 never reach encodeFrame)");
+    // VMX fills its alpha plane from the BGRA path (vmxcodec.cpp:1825 sets VMX_IMAGE_BGRA; the BGRX
+    // variant memsets plane 3 to 255 at :1150). UYVY/YUY2/NV12 have no alpha plane to advertise.
+    if ((frame.flags & VideoFlags::Alpha) && frame.codec != Codec::BGRA)
+        return reject("Alpha claimed on " + std::string(codecName(frame.codec)) +
+                      " (only the BGRA path produces an alpha plane; UYVY/YUY2/NV12 have none)");
+    if ((frame.flags & VideoFlags::PreMultiplied) && !(frame.flags & VideoFlags::Alpha))
+        return reject("PreMultiplied without Alpha (libomt.h:125 — it qualifies the alpha channel, "
+                      "and there is none in this payload to qualify)");
+    if ((frame.flags & VideoFlags::Interlaced) && !interlacedHeightSupported(frame.height))
+        return reject("Interlaced at height " + std::to_string(frame.height) +
+                      " (VMX_ConfigureInterlaced interlaces 480/576/1080 only and silently stays "
+                      "progressive elsewhere — the header would advertise a field order the payload has not got)");
+    // Published as-is, and a receiver divides by it to place the picture. NaN/Inf/0/negative is not
+    // an aspect ratio; it is a header that cannot be rendered.
+    if (!std::isfinite(frame.aspectRatio) || frame.aspectRatio <= 0.0f)
+        return reject("aspect ratio " + std::to_string(frame.aspectRatio) +
+                      " is not a positive finite number (it goes on the wire and the receiver divides by it)");
     return true;
 }
 
@@ -587,6 +753,9 @@ int Sender::send(const MediaFrame& frame) {
     std::string why;
     int encodedLen = 0;
     bool havePayload = false;
+    FrameHeader header{};
+    VideoExtHeader extHeader{};
+    EncoderIdentity producer;
 
     // Runs BEFORE the no-clients shortcut, like the colour-space gate it absorbs: a frame the
     // buffer cannot honour is refused whether or not anyone is watching, so the device that would
@@ -604,13 +773,19 @@ int Sender::send(const MediaFrame& frame) {
         if (createEncoder(frame.width, frame.height,
                           frame.frameRateN / frame.frameRateD,
                           frame.colorSpace, why)) {
-            // Encode frame
-            encodedLen = encodeFrame(frame);
+            // Encode frame. `producer` is the identity of the instance that made these bytes.
+            encodedLen = encodeFrame(frame, &producer);
             havePayload = encodedLen > 0;
             if (!havePayload) {
                 why = "encoder produced no payload (codec " +
                       std::to_string(frame.codec) + ", " + std::to_string(frame.width) + "x" +
                       std::to_string(frame.height) + ")";
+            } else if (!buildVideoHeaders(frame, producer, encodedLen, header, extHeader, why)) {
+                // The header would not match the payload. Counted and named like every other
+                // refusal below — a frame that leaves no picture behind must not leave no reason
+                // either.
+                havePayload = false;
+                encodedLen = 0;
             }
         }
     }
@@ -634,23 +809,9 @@ int Sender::send(const MediaFrame& frame) {
         checkCongestion();
     }
     
-    // Build headers
-    FrameHeader header{};
-    header.version = 1;
-    header.frameType = static_cast<uint8_t>(FrameType::Video);
-    header.timestamp = frame.timestamp;
-    header.metadataLength = 0;
-    header.dataLength = VideoExtHeader::SIZE + encodedLen;
-    
-    VideoExtHeader extHeader{};
-    extHeader.codec = Codec::VMX1;
-    extHeader.width = frame.width;
-    extHeader.height = frame.height;
-    extHeader.frameRateN = frame.frameRateN;
-    extHeader.frameRateD = frame.frameRateD;
-    extHeader.aspectRatio = frame.aspectRatio;
-    extHeader.flags = frame.flags;
-    extHeader.colorSpace = frame.colorSpace;
+    // The two headers were assembled by buildVideoHeaders() above, from `producer` — the encoder
+    // that actually produced this payload — so the declaration and the bytes it describes cannot be
+    // built apart from each other. Nothing below this line may re-derive a wire field from `frame`.
     
     // Send to all subscribed clients
     int totalSent = 0;

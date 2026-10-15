@@ -831,6 +831,229 @@ fi
 
 echo
 
+# build_and_run_tree <name> <test.cpp> <omt-src-dir> <expect pass|fail> [vmx-source-dir|STUB]
+#   Like build_and_run, but <omt-src-dir> goes FIRST on the include path so the scenario compiles
+#   against that copy's HEADERS as well as its sources. Required for every pre-fix run: the tree's
+#   OMTSender.h now declares members (EncoderIdentity, buildVideoHeaders, the identity-capturing
+#   encodeFrame) that the old .cpp never defines, so mixing the two is a compile error — and a
+#   compile error is not a red run, it is an absent one.
+build_and_run_tree() {
+  local name=$1 test=$2 srcdir=$3 expect=$4 vmxdir=${5:-$ROOT/libvmx/src}
+  local vmxsrcs
+  if [ "$vmxdir" = "STUB" ]; then
+    vmxsrcs="$ROOT/qa/stub_vmx.cpp"
+  else
+    vmxsrcs="$vmxdir/vmxcodec.cpp $vmxdir/vmxcodec_x86.cpp $vmxdir/vmxcodec_avx2.cpp"
+  fi
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS -I"$srcdir" $INC "$test" "$srcdir/OMTChannel.cpp" "$srcdir/OMTAsyncPool.cpp" \
+       "$srcdir/OMTSender.cpp" "$srcdir/OMTDiscovery.cpp" $vmxsrcs \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
+    rc=1; return
+  fi
+  score_run "$name" "$expect"
+}
+
+# extract_libomt <dir> <git-ref> — a whole libomt/cpp (sources AND headers) as it stood at <git-ref>,
+# for a pre-fix run. The caller must verify the extraction actually looks pre-fix.
+extract_libomt() {
+  local d="$SCRATCH/$1" ref=$2
+  rm -rf "$d"; mkdir -p "$d"
+  for f in OMTChannel.cpp OMTAsyncPool.cpp OMTSender.cpp OMTDiscovery.cpp \
+           OMTChannel.h OMTSender.h OMTDiscovery.h OMTConstants.h OMTProtocol.h OMTAsyncPool.h; do
+    git show "$ref:libomt/cpp/$f" > "$d/$f" 2>/dev/null || { echo "  cannot extract $f from $ref"; rc=1; }
+  done
+  echo "$d"
+}
+
+echo
+echo "== encoder-reconfiguration: the header may only describe the encoder that made the payload =="
+# The defect: createEncoder() reused a VMX instance on width+height alone while the colour space it
+# was handed decided the codec's RGB<->YUV table and the frame's colour space went into the header.
+# The scenario links the REAL codec and compares each payload against independently created reference
+# encoders, so "which matrix made these bytes" is measured, not asserted from the sender's own cache.
+grep -q 'currentColorSpace_ == colorSpace' "$ROOT/libomt/cpp/OMTSender.cpp" \
+  || { echo "  the tree does not contain the encoder-key fix — there is nothing to score"; rc=1; }
+build_and_run er-fixed "$ROOT/qa/encoder-reconfiguration.cpp" "$ROOT/libomt/cpp" pass
+
+# PINNED, not origin/master: a moving ref here silently turns the must-fail control into a no-op the
+# day the fix lands upstream (exactly the defect class fixed for RPBASE/HPBASE today). d9814679 is the
+# commit this branch was written against and is genuinely pre-fix. Override with QA_ER_BASE=<rev>.
+BASE_ER=${QA_ER_BASE:-d9814679}
+require_rev "$BASE_ER" "pre-fix source of encoder-reconfiguration"
+ER_OLD=$(extract_libomt pre-fix-encoder "$BASE_ER")
+grep -q 'currentColorSpace_ == colorSpace' "$ER_OLD/OMTSender.cpp" \
+  && { echo "  the pre-fix copy ALREADY has the key fix — extraction from $BASE_ER is wrong"; rc=1; }
+build_and_run_tree er-prefix "$ROOT/qa/encoder-reconfiguration.cpp" "$ER_OLD" fail
+
+# ME1: the key clause alone, back out. This is the same regression as er-prefix, isolated to one
+# condition, so a future refactor that keeps the cache but drops the comparison cannot pass unnoticed.
+ME1=$(fresh_copy mutant-encoder-key)
+python3 - "$ME1/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "        currentColorSpace_ == colorSpace) {"
+assert s.count(old) == 1, "encoder-reuse colour-space key clause not found"
+open(p, "w").write(s.replace(old, "        true) {  // MUTANT: the reuse key is back to width+height alone", 1))
+PY
+build_and_run er-mutant-key "$ROOT/qa/encoder-reconfiguration.cpp" "$ME1" fail
+
+echo
+echo "== wire-declaration: the declaration is built from the encoder, never from the caller's struct =="
+build_and_run wd-fixed "$ROOT/qa/wire-declaration.cpp" "$ROOT/libomt/cpp" pass STUB
+build_and_run wd-mutant-key "$ROOT/qa/wire-declaration.cpp" "$ME1" fail STUB
+
+# MW1 WAS ATTEMPTED AND WITHDRAWN (not scored, on purpose). Mutating the published value
+# `ext.colorSpace = encoder.colorSpace` back to `frame.colorSpace` cannot be turned red by any test
+# while MW2's tripwire is present: buildVideoHeaders() refuses every frame where the two differ, so
+# on every input the function accepts they are equal and the two spellings are the same program. It
+# is an equivalent mutant, and scoring an equivalent mutant as "must fail" would either fail the
+# suite forever or push someone to invent an assertion that cannot distinguish anything. What the
+# pair means: publishing from the encoder is the belt, the tripwire is the brace, and the falsifiable
+# property is the conjunction — MW2 (tripwire removed) is its control, and er-mutant-key / er-prefix
+# are the controls for the key that keeps them equal on the live path. If the tripwire is ever
+# deleted, restore MW1 here and it will go red on its own.
+# MW2: the mismatch tripwire removed — a contradictory (frame, encoder) pair is then published as a
+# frame instead of refused. This is the scored control for the whole declaration-honesty clause.
+MW2=$(fresh_copy mutant-tripwire)
+python3 - "$MW2/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    if (encoder.colorSpace != frame.colorSpace)"
+assert s.count(old) == 1, "the encoder/frame colour-space tripwire is not where it was left"
+open(p, "w").write(s.replace(old, "    if (false && encoder.colorSpace != frame.colorSpace)", 1))
+PY
+build_and_run wd-mutant-tripwire "$ROOT/qa/wire-declaration.cpp" "$MW2" fail STUB
+
+# MW3: the belt on the value that reaches the wire (0/601/709), independent of validateFrame.
+MW3=$(fresh_copy mutant-declare-belt)
+python3 - "$MW3/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    if (encoder.colorSpace != ColorSpace::Undefined &&\n        encoder.colorSpace != ColorSpace::BT601 &&\n        encoder.colorSpace != ColorSpace::BT709)\n        return reject(\"the encoder reports colour space \""
+assert s.count(old) == 1, "the header builder's colour-space belt not found"
+open(p, "w").write(s.replace(old, "    if (false)\n        return reject(\"the encoder reports colour space \"", 1))
+PY
+build_and_run wd-mutant-belt "$ROOT/qa/wire-declaration.cpp" "$MW3" fail STUB
+
+# MW4: the size clause. A header may not carry a size the encoder does not have.
+MW4=$(fresh_copy mutant-declare-size)
+python3 - "$MW4/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    if (encoder.width != frame.width || encoder.height != frame.height)"
+assert s.count(old) == 1, "the encoder/frame size clause not found"
+open(p, "w").write(s.replace(old, "    if (false && (encoder.width != frame.width || encoder.height != frame.height))", 1))
+PY
+build_and_run wd-mutant-size "$ROOT/qa/wire-declaration.cpp" "$MW4" fail STUB
+
+# MW5: the "no encoder, no declaration" clause.
+MW5=$(fresh_copy mutant-declare-noencoder)
+python3 - "$MW5/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    if (!encoder.valid)\n        return reject(\"no encoder was captured"
+assert s.count(old) == 1, "the encoder.valid clause not found"
+open(p, "w").write(s.replace(old, "    if (false)\n        return reject(\"no encoder was captured", 1))
+PY
+build_and_run wd-mutant-noencoder "$ROOT/qa/wire-declaration.cpp" "$MW5" fail STUB
+
+# MW6: the length clause — a payload that does not exist cannot be declared.
+MW6=$(fresh_copy mutant-declare-nolength)
+python3 - "$MW6/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    if (encodedLen <= 0)\n        return reject("
+assert s.count(old) == 1, "the encodedLen clause not found"
+open(p, "w").write(s.replace(old, "    if (false)\n        return reject(", 1))
+PY
+build_and_run wd-mutant-nolength "$ROOT/qa/wire-declaration.cpp" "$MW6" fail STUB
+
+# MW7: the identity capture itself. If encodeFrame() stopped reporting which instance wrote the
+# payload, every frame would be refused — this is what proves the declaration path is really on the
+# wire rather than a decoration the sender could skip.
+MW7=$(fresh_copy mutant-no-identity)
+python3 - "$MW7/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "        used->valid = (currentWidth_ == frame.width && currentHeight_ == frame.height &&\n                       currentColorSpace_ == frame.colorSpace);"
+assert s.count(old) == 1, "the identity capture not found"
+open(p, "w").write(s.replace(old, "        used->valid = false;  // MUTANT: the producer never identifies itself", 1))
+PY
+build_and_run wd-mutant-noident "$ROOT/qa/wire-declaration.cpp" "$MW7" fail STUB
+build_and_run er-mutant-noident "$ROOT/qa/encoder-reconfiguration.cpp" "$MW7" fail
+
+echo
+echo "== declaration-gate: no claim on the wire that the payload does not carry =="
+build_and_run dg-fixed "$ROOT/qa/declaration-gate.cpp" "$ROOT/libomt/cpp" pass STUB
+
+DG_OLD=$(extract_libomt pre-fix-decl "$BASE_ER")
+grep -q 'HighBitDepth claimed' "$DG_OLD/OMTSender.cpp" \
+  && { echo "  the pre-fix copy ALREADY has the flag gates — extraction from $BASE_ER is wrong"; rc=1; }
+build_and_run_tree dg-prefix "$ROOT/qa/declaration-gate.cpp" "$DG_OLD" fail STUB
+
+# One mutant per new clause. Each is expected to let exactly its own case through.
+dg_mutant() { # <slug> <anchor> <replacement>
+  local name=$1 old=$2 new=$3
+  local M; M=$(fresh_copy "mutant-$1")
+  python3 - "$M/OMTSender.cpp" "$old" "$new" <<'PY'
+import sys
+p, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+s = open(p).read()
+assert s.count(old) == 1, "anchor not found (or not unique): " + old[:70]
+open(p, "w").write(s.replace(old, new, 1))
+PY
+  build_and_run "dg-mutant-$1" "$ROOT/qa/declaration-gate.cpp" "$M" fail STUB
+}
+
+dg_mutant highbitdepth \
+  '    if (frame.flags & VideoFlags::HighBitDepth)' \
+  '    if (false && (frame.flags & VideoFlags::HighBitDepth))'
+dg_mutant alpha-plane \
+  '    if ((frame.flags & VideoFlags::Alpha) && frame.codec != Codec::BGRA)' \
+  '    if (false && (frame.flags & VideoFlags::Alpha) && frame.codec != Codec::BGRA)'
+dg_mutant premultiplied \
+  '    if ((frame.flags & VideoFlags::PreMultiplied) && !(frame.flags & VideoFlags::Alpha))' \
+  '    if (false && (frame.flags & VideoFlags::PreMultiplied) && !(frame.flags & VideoFlags::Alpha))'
+dg_mutant unknown-bits \
+  '    if (frame.flags & ~knownFlags) {' \
+  '    if (false && (frame.flags & ~knownFlags)) {'
+dg_mutant interlace-claim \
+  '    if ((frame.flags & VideoFlags::Interlaced) && !interlacedHeightSupported(frame.height))' \
+  '    if (false && (frame.flags & VideoFlags::Interlaced) && !interlacedHeightSupported(frame.height))'
+dg_mutant aspect-ratio \
+  '    if (!std::isfinite(frame.aspectRatio) || frame.aspectRatio <= 0.0f)' \
+  '    if (false && (!std::isfinite(frame.aspectRatio) || frame.aspectRatio <= 0.0f))'
+# The interlace heights, widened to "anything": the header would then advertise a field order the
+# codec silently declined to produce.
+dg_mutant interlace-heights \
+  '    return height == 480 || height == 576 || height == 1080;' \
+  '    return true;  // MUTANT: the codec never consulted about the field order'
+# The flag NUMBERING, not a gate: HighBitDepth back to 4 (which is PreMultiplied on the wire), with
+# the compile-time pin taken out so the mutant builds and the runtime assertion is what catches it.
+MNUM=$(fresh_copy mutant-flag-numbering)
+python3 - "$MNUM/OMTProtocol.h" "$MNUM/OMTSender.cpp" <<'PY'
+import sys
+proto, sender = sys.argv[1], sys.argv[2]
+s = open(proto).read()
+old = "    constexpr int32_t HighBitDepth = 16;"
+assert s.count(old) == 1, "HighBitDepth constant not found"
+open(proto, "w").write(s.replace(old, "    constexpr int32_t HighBitDepth = 4;  // MUTANT: the old wrong number", 1))
+s = open(sender).read()
+old = "static_assert(VideoFlags::Interlaced == 1 && VideoFlags::Alpha == 2 &&"
+assert s.count(old) == 1, "the flag static_assert pin not found"
+i = s.index(old); j = s.index(');\n', i) + 3
+open(sender, "w").write(s[:i] + "  // MUTANT: the compile-time pin removed so the wrong number builds\n" + s[j:])
+PY
+build_and_run_tree dg-mutant-flag-numbering "$ROOT/qa/declaration-gate.cpp" "$MNUM" fail STUB
+
+echo
+
+
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
   echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"

@@ -69,13 +69,25 @@ namespace Codec {
     constexpr int32_t PCM_F32 = 0x32334650; // "FP32" (floating point audio)
 }
 
-// Video flags
+// Video flags — the numbers MUST match the authority in libomt.h:135-144 (OMTVideoFlags), which is
+// what every conforming receiver decodes: Interlaced=1, Alpha=2, PreMultiplied=4, Preview=8,
+// HighBitDepth=16.
+//
+// HighBitDepth was 4 here — and 4 is PreMultiplied on the wire — while PreMultiplied was absent.
+// Nothing in this tree read the constant, so the mistake stayed latent; Sender::validateFrame() now
+// reads the flag set to decide what may be advertised, which is exactly when a wrong constant turns
+// into a wrong verdict (it would have rejected a legitimate PreMultiplied frame and waved through a
+// HighBitDepth claim no payload can back). This is the same second-numbering trap the colour block
+// below once fell into, where the header that defines the wire struct carried BT601=1/BT709=2.
+// qa/wire-declaration.cpp pins every one of these against the public C enum, and the constants are
+// pinned at compile time in OMTSender.cpp next to the colour-space assert.
 namespace VideoFlags {
     constexpr int32_t None = 0;
     constexpr int32_t Interlaced = 1;
     constexpr int32_t Alpha = 2;
-    constexpr int32_t HighBitDepth = 4;
+    constexpr int32_t PreMultiplied = 4;
     constexpr int32_t Preview = 8;
+    constexpr int32_t HighBitDepth = 16;
 }
 
 // Colour space — the values that go into VideoExtHeader::colorSpace.
