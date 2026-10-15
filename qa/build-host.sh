@@ -1073,75 +1073,89 @@ build_and_run rv-fixed "$ROOT/qa/receiver-validation.cpp" "$ROOT/libomt/cpp" pas
 
 PFR="$SCRATCH/pre-fix-recv"; rm -rf "$PFR"; mkdir -p "$PFR"
 cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$PFR"/
-git show "${QA_BASE:-fix/omt-announcement-truthfulness}:libomt/cpp/OMTChannel.cpp" > "$PFR/OMTChannel.cpp" \
-  || { echo "  cannot extract OMTChannel.cpp from the base revision"; rc=1; }
-grep -q 'FD_SET(socketFd_' "$PFR/OMTChannel.cpp" \
-  || { echo "  the pre-fix copy has no FD_SET — extraction failed, refusing to score it"; rc=1; }
-grep -q 'noteCloseReason' "$PFR/OMTChannel.cpp" \
-  && { echo "  the pre-fix copy still validates — extraction failed, refusing to score it"; rc=1; }
+# Pinned to adf620a3 — the last commit on master to touch OMTChannel.cpp before this branch.
+# The branch's original pin, d9814679, predated #22: its OMTChannel.cpp defines the 3-arg
+# sendWithDeadline(data, length, timeoutMs), the tree's header declares the 4-arg
+# sendWithDeadline(fd, data, length, timeoutMs), and the extracted copy stopped compiling
+# against it the moment #22 merged (rv-prefix(build-failed) — refused to score, never a lie).
+# adf620a3's file is exactly "this branch's product commit, removed" against the current tree:
+# same FD_SET-in-receiverLoop defect, same absent validation, API-matched to the header. The
+# pin is an immutable merged sha, so it stays truthful after this branch merges too. Headers
+# stay the tree's so every TU agrees on Channel's layout (rule 15 — the CloseReason accessors
+# the test asserts on are inline in the header, and the pre-fix .cpp simply never calls them:
+# every close reads "none", which is the honest pre-fix observable).
+BASE_RV=${QA_BASE:-adf620a3}
+extract_rev_file "$BASE_RV" "libomt/cpp/OMTChannel.cpp" "$PFR/OMTChannel.cpp"
+must_grep     "$PFR/OMTChannel.cpp" 'FD_SET(socketFd_'
+must_not_grep "$PFR/OMTChannel.cpp" 'noteCloseReason' 
 build_and_run rv-prefix "$ROOT/qa/receiver-validation.cpp" "$PFR" fail
 
 # MR1: the negative-length gate removed. This is the -16 spin, in one line.
 MR1=$(fresh_copy mutant-no-negcheck)
-python3 - "$MR1/OMTChannel.cpp" <<'PY'
+if apply_mutant rv-mutant-no-negcheck "$MR1/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "            if (header.dataLength < 0) {"
 assert s.count(old) == 1, "dataLength < 0 gate not found"
 open(p, "w").write(s.replace(old, "            if (false && header.dataLength < 0) {  // MUTANT", 1))
 PY
-build_and_run rv-mutant-no-negcheck "$ROOT/qa/receiver-validation.cpp" "$MR1" fail
+then build_and_run rv-mutant-no-negcheck "$ROOT/qa/receiver-validation.cpp" "$MR1" fail
+fi
 
 # MR2: the size ceiling removed — an absurd dataLength is then simply waited on forever, so the
 # channel is never closed and never named.
 MR2=$(fresh_copy mutant-no-maxcheck)
-python3 - "$MR2/OMTChannel.cpp" <<'PY'
+if apply_mutant rv-mutant-no-maxcheck "$MR2/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "            if (header.dataLength > kMaxControlPayload) {"
 assert s.count(old) == 1, "dataLength ceiling not found"
 open(p, "w").write(s.replace(old, "            if (false && header.dataLength > kMaxControlPayload) {  // MUTANT", 1))
 PY
-build_and_run rv-mutant-no-maxcheck "$ROOT/qa/receiver-validation.cpp" "$MR2" fail
+then build_and_run rv-mutant-no-maxcheck "$ROOT/qa/receiver-validation.cpp" "$MR2" fail
+fi
 
 # MR3: the frame-type gate removed. A sender accepts Metadata only; Video/Audio records from a peer
 # are malformed, and parsing them as XML is how a mis-framed stream starts.
 MR3=$(fresh_copy mutant-no-frametype)
-python3 - "$MR3/OMTChannel.cpp" <<'PY'
+if apply_mutant rv-mutant-no-frametype "$MR3/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "            if (header.frameType != static_cast<uint8_t>(FrameType::Metadata)) {"
 assert s.count(old) == 1, "frameType gate not found"
 open(p, "w").write(s.replace(old, "            if (false && header.frameType != static_cast<uint8_t>(FrameType::Metadata)) {  // MUTANT", 1))
 PY
-build_and_run rv-mutant-no-frametype "$ROOT/qa/receiver-validation.cpp" "$MR3" fail
+then build_and_run rv-mutant-no-frametype "$ROOT/qa/receiver-validation.cpp" "$MR3" fail
+fi
 
 # MR4: metadataLength no longer has to fit inside dataLength.
 MR4=$(fresh_copy mutant-no-metalen)
-python3 - "$MR4/OMTChannel.cpp" <<'PY'
+if apply_mutant rv-mutant-no-metalen "$MR4/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "            if (static_cast<int32_t>(header.metadataLength) > header.dataLength) {"
 assert s.count(old) == 1, "metadataLength gate not found"
 open(p, "w").write(s.replace(old, "            if (false && static_cast<int32_t>(header.metadataLength) > header.dataLength) {  // MUTANT", 1))
 PY
-build_and_run rv-mutant-no-metalen "$ROOT/qa/receiver-validation.cpp" "$MR4" fail
+then build_and_run rv-mutant-no-metalen "$ROOT/qa/receiver-validation.cpp" "$MR4" fail
+fi
 
 # MR5: the version gate removed (it existed before this branch; the assertion on its NAME did not).
 MR5=$(fresh_copy mutant-no-versioncheck)
-python3 - "$MR5/OMTChannel.cpp" <<'PY'
+if apply_mutant rv-mutant-no-versioncheck "$MR5/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "            if (header.version != 1) {"
 assert s.count(old) == 1, "version gate not found"
 open(p, "w").write(s.replace(old, "            if (false && header.version != 1) {  // MUTANT", 1))
 PY
-build_and_run rv-mutant-no-versioncheck "$ROOT/qa/receiver-validation.cpp" "$MR5" fail
+then build_and_run rv-mutant-no-versioncheck "$ROOT/qa/receiver-validation.cpp" "$MR5" fail
+fi
 
 # MR6: select()/FD_SET put back over the poll(). Only the high-fd case can see this, which is why
 # the case exists: at fd < 1024 select() and poll() behave identically.
 MR6=$(fresh_copy mutant-select)
-python3 - "$MR6/OMTChannel.cpp" <<'PY'
+if apply_mutant rv-mutant-select "$MR6/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "        struct pollfd pfd{fd, POLLIN, 0};\n        int sel = ::poll(&pfd, 1, 100);"
@@ -1153,7 +1167,8 @@ s = s.replace(old, new, 1)
 assert "#include <netinet/tcp.h>" in s
 open(p, "w").write(s.replace("#include <netinet/tcp.h>", "#include <netinet/tcp.h>\n#include <sys/select.h>", 1))
 PY
-build_and_run rv-mutant-select "$ROOT/qa/receiver-validation.cpp" "$MR6" fail
+then build_and_run rv-mutant-select "$ROOT/qa/receiver-validation.cpp" "$MR6" fail
+fi
 
 # MR7: the flags stop being re-checked inside the parse loop. The running-flag case parks the
 # receiver inside the quality callback, tears the channel down, and hands back exactly one permit —
@@ -1161,7 +1176,7 @@ build_and_run rv-mutant-select "$ROOT/qa/receiver-validation.cpp" "$MR6" fail
 # join hangs. Forced, not sampled: the frames alternate High/Low because processMetadata only
 # notifies on a CHANGE, and identical frames would have made the mutant green.
 MR7=$(fresh_copy mutant-no-running-check)
-python3 - "$MR7/OMTChannel.cpp" <<'PY'
+if apply_mutant rv-mutant-no-running-check "$MR7/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = ("            if (!running_ || !connected_) break;\n"
@@ -1171,19 +1186,21 @@ new = ("            if (false) break;  // MUTANT: teardown cannot interrupt a ba
        "\n            // Copy the header into a local BEFORE")
 open(p, "w").write(s.replace(old, new, 1))
 PY
-build_and_run rv-mutant-no-running-check "$ROOT/qa/receiver-validation.cpp" "$MR7" fail
+then build_and_run rv-mutant-no-running-check "$ROOT/qa/receiver-validation.cpp" "$MR7" fail
+fi
 
 # MR8: the channel still closes for a negative length, but never SAYS why. Proves the named-error
 # assertion is load-bearing and not decoration riding on the close that the validation already did.
 MR8=$(fresh_copy mutant-no-reason)
-python3 - "$MR8/OMTChannel.cpp" <<'PY'
+if apply_mutant rv-mutant-no-reason "$MR8/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "                noteCloseReason(CloseReason::NegativeDataLength);"
 assert s.count(old) == 1, "negative-dataLength reason not found"
 open(p, "w").write(s.replace(old, "                ; // MUTANT: closed silently, no name on the failure", 1))
 PY
-build_and_run rv-mutant-no-reason "$ROOT/qa/receiver-validation.cpp" "$MR8" fail
+then build_and_run rv-mutant-no-reason "$ROOT/qa/receiver-validation.cpp" "$MR8" fail
+fi
 
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
