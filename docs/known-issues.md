@@ -64,6 +64,16 @@ OMT code.
 
 7. **`YUV_420_888` is treated as NV12 without checking `pixelStride`.** A device
    reporting a fully planar layout produces wrong chroma rather than an error.
+   *Fixed here:* `omtpack::packNv12()` (`app/src/main/cpp/omtnv12.h`) asks the HAL
+   which chroma layout it chose — `planes[1].getPixelStride()`, 2 for interleaved
+   NV12, 1 for planar I420 — interleaves Cb/Cr when it has to, and the frame is now
+   charged for the bytes it actually wrote instead of for two strides that need not
+   agree. Measured on the emulator (Android 15, `sdk_gphone64_x86_64`, back camera):
+   y `rowStride=1920 pixelStride=1`, chroma `rowStride=960 pixelStride=1` — a planar
+   device, so every frame came up `1080*1920 + 540*960 = 2592000` bytes against the
+   `3110400` the encoder reads, and `Sender::validateFrame()` refused all of them:
+   the wire carried the greeting, the metadata, and 0 video frames. Both layouts are
+   under test in `qa/planar-chroma.cpp`, with the planar case pinned at that geometry.
 
 8. **`SO_SNDBUF` is forced**, which switches off kernel auto-tuning; on a healthy
    link that is usually worse than letting the stack decide.
