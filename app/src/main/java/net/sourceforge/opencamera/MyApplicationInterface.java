@@ -1224,8 +1224,14 @@ public class MyApplicationInterface extends BasicApplicationInterface {
     public String getOmtStreamingName() {
         // 1. Check for user-defined custom name
         String customName = sharedPreferences.getString(PreferenceKeys.OmtStreamingNameKey, null);
-        if (customName != null && !customName.isEmpty()) {
-            return customName;
+        // A free-text preference handed straight to NsdServiceInfo used to make the phone invisible
+        // to conforming OMT receivers: libomtnet's OMTAddress.IsValid discards any instance name
+        // without a matched '(' ')' pair, so a user who typed "PhoneCam" got a healthy-looking
+        // sender that OBS would never list. normalize() returns null when there is nothing usable,
+        // which falls through to the device-derived default below.
+        String normalized = OMTStreamName.normalize(customName);
+        if (normalized != null) {
+            return normalized;
         }
         
         // 2. Auto-generate unique name: Model_XXXX (Camera)
