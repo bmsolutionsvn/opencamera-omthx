@@ -323,6 +323,7 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             if (MyDebug.LOG)
                 Log.d(TAG, "is_test: " + is_test);
         }
+        handleOmtDebugIntent();
         /*
          * if( getIntent() != null && getIntent().getExtras() != null ) {
          * // whether called from Take Photo widget
@@ -2320,6 +2321,99 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             startOmtStreaming();
         }
     }
+
+    /*
+     * Debug-only OMT intent driver — see OmtDebugCommands for the why. Honoured only when the
+     * installed APK is debuggable; a release build logs and ignores the extra. The command runs
+     * through the same clickedOmtStreaming() the on-screen button calls, so the emulator test
+     * drives behaviour instead of pixels.
+     */
+    private final Handler omtDebugHandler = new Handler(Looper.getMainLooper());
+    private OmtDebugCommands.Command pendingOmtDebug;
+    private int omtDebugTicks;
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        // am start on a running activity lands here; without this the extra would never be read.
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleOmtDebugIntent();
+    }
+
+    private void handleOmtDebugIntent() {
+        Intent intent = getIntent();
+        if (intent == null || intent.getExtras() == null)
+            return;
+        OmtDebugCommands.Command cmd =
+                OmtDebugCommands.parse(intent.getExtras().getString(OmtDebugCommands.EXTRA_COMMAND));
+        if (cmd == null)
+            return; // no command (normal launch) — stay completely out of the way
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
+            Log.w("OmtDebug", "command '" + cmd + "' ignored: not a debuggable build");
+            return;
+        }
+        Log.i("OmtDebug", "command accepted: " + cmd);
+        pendingOmtDebug = cmd;
+        omtDebugTicks = 0;
+        omtDebugHandler.removeCallbacks(omtDebugTick);
+        omtDebugHandler.post(omtDebugTick);
+    }
+
+    private final Runnable omtDebugTick = new Runnable() {
+        @Override
+        public void run() {
+            if (pendingOmtDebug == null)
+                return;
+            // The button is only live once the camera is up; startOmtStreaming() reads the video
+            // profile and (post-#28) the ImageReader needs Camera2. Retry until ready, cap at 30s,
+            // and if the cap is hit log loudly — a silent no-op is exactly what UI automation used
+            // to produce.
+            // Readiness is NOT "camera stopped opening": the video profile is filled in
+            // asynchronously after cameraSetup, and startOmtStreaming() reads it unguarded —
+            // measured on the emulator: accepted too early produced
+            // "OMTStreamingManager: Starting OMT streaming: 0x0@30fps" and a stream that
+            // announces but carries 0 video. The on-screen button can't be pressed that early,
+            // which is why this never bit real users. Wait for a non-zero profile too.
+            VideoProfile vp = (preview == null) ? null : preview.getVideoProfile();
+            boolean ready = preview != null && !preview.isOpeningCamera()
+                    && vp != null && vp.videoFrameWidth > 0 && vp.videoFrameHeight > 0;
+            if (!ready) {
+                if (++omtDebugTicks >= 60) {
+                    Log.e("OmtDebug", "camera not ready after 30s — command " + pendingOmtDebug
+                            + " NOT executed");
+                    pendingOmtDebug = null;
+                } else {
+                    omtDebugHandler.postDelayed(this, 500);
+                }
+                return;
+            }
+            OmtDebugCommands.Command cmd = pendingOmtDebug;
+            pendingOmtDebug = null;
+            boolean streaming = omtStreamingManager != null && omtStreamingManager.isStreaming();
+            Log.i("OmtDebug", "executing " + cmd + " after " + omtDebugTicks + " wait tick(s);"
+                    + " streaming=" + streaming
+                    + " camera2=" + (preview != null && preview.usingCamera2API()));
+            switch (cmd) {
+                case START_STREAM:
+                    if (!streaming)
+                        clickedOmtStreaming(null);
+                    else
+                        Log.i("OmtDebug", "already streaming — start skipped");
+                    break;
+                case STOP_STREAM:
+                    if (streaming)
+                        clickedOmtStreaming(null);
+                    else
+                        Log.i("OmtDebug", "not streaming — stop skipped");
+                    break;
+                case STATUS:
+                    Log.i("OmtDebug", "status: streaming=" + streaming
+                            + " announcing=" + (omtStreamingManager != null && omtStreamingManager.isAnnouncing()));
+                    break;
+            }
+        }
+    };
+
 
     /**
      * Start OMT video streaming.
