@@ -667,6 +667,59 @@ PY
   if [ $? -ne 0 ]; then echo "  $4: MUTATION FAILED (the clause is gone — the suite would pass by forgetting)"; rc=1; fi
 }
 
+# ---------------------------------------------------------------------------
+# jni-boundary: the same discipline one level up, at the JNI entry point.
+#
+# qa/jni-boundary.cpp compiles app/src/main/cpp/OMTBridge.cpp — the production translation unit, not a
+# transcription — against qa/host-jni/jni.h, and links the real sender and the real codec behind it.
+# The JNIEnv it drives is the test's, so the test decides what each direct buffer's ADDRESS and
+# CAPACITY are, and every plane is malloc'd to exactly the capacity the bridge is told about. That is
+# what turns "the bridge trusted a caller-supplied length" into an ASan heap-buffer-overflow instead
+# of a code review finding: jb-mutant-no-admission deletes the vetting and the same binary dies.
+# ---------------------------------------------------------------------------
+# build_jni <name> <expect pass|fail> <OMTBridge.cpp to compile> [extra compiler flags...]
+# The directory holding that OMTBridge.cpp goes FIRST on the include path, so a mutant's copy of
+# omtnv12.h really is the header the bridge compiles against.
+build_jni() {
+  local name=$1 expect=$2 bridge=$3; shift 3
+  local extra="$*"
+  [ -f "$bridge" ] || harness_die "build_jni $name: no such bridge source: $bridge"
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS $extra $INC -I"$(dirname "$bridge")" -I"$ROOT/qa/host-jni" -I"$ROOT/app/src/main/cpp" \
+       "$ROOT/qa/jni-boundary.cpp" "$bridge" \
+       "$ROOT/libomt/cpp/OMTChannel.cpp" "$ROOT/libomt/cpp/OMTAsyncPool.cpp" \
+       "$ROOT/libomt/cpp/OMTSender.cpp" "$ROOT/libomt/cpp/OMTDiscovery.cpp" \
+       "$ROOT/libvmx/src/vmxcodec.cpp" "$ROOT/libvmx/src/vmxcodec_x86.cpp" \
+       "$ROOT/libvmx/src/vmxcodec_avx2.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -15
+    rc=1; return
+  fi
+  score_run "$name" "$expect"
+}
+
+fresh_copy_jni() { # <dir> — the bridge AND the header it includes, so either can be the mutant
+  local d="$SCRATCH/$1"; rm -rf "$d"; mkdir -p "$d"
+  cp "$ROOT"/app/src/main/cpp/OMTBridge.cpp "$ROOT"/app/src/main/cpp/omtnv12.h "$d"/ \
+    || { echo "QA HARNESS ERROR: cannot copy the JNI bridge into $d" >&2; return 1; }
+  echo "$d"
+}
+
+mutate_jni() { # <dir> <file> <old> <new> <what> — one property of the boundary sabotaged
+  local d=$1 f=$2
+  python3 - "$d/$f" "$3" "$4" "$5" <<'PY'
+import sys
+p, old, new, what = sys.argv[1:5]
+s = open(p).read()
+assert s.count(old) == 1, "cannot find the clause to mutate (%s): %r" % (what, old[:70])
+open(p, "w").write(s.replace(old, new, 1))
+PY
+  if [ $? -ne 0 ]; then echo "  $5: MUTATION FAILED (the clause is gone — the boundary would pass by forgetting)"; rc=1; fi
+}
+
 echo "== planar-chroma: YUV_420_888 is two layouts, and the sender must serve both =="
 build_planar pc-fixed pass
 
@@ -674,14 +727,15 @@ build_planar pc-fixed pass
 # branch. Red on case B (the emulator's planar I420) is the point of the whole exercise.
 build_planar pc-prefix fail -DOMT_QA_PLANAR_PREFIX
 
-# MP1: pixelStride ignored — the packer decides "interleaved" without asking the HAL. The planar
-# frames then fail the NV12 row-width check and never reach the encoder at all.
+# MP1: pixelStride ignored — the packer samples every component two bytes apart because that is what
+# an NV12 device happens to do. A planar Cb plane read this way skips half its samples and then walks
+# off the end of a plane allocated to its own reported limit.
 MP1=$(fresh_copy_bridge mutant-pixelstride)
 mutate_bridge "$MP1" \
-  '    const bool planar = (u.pixelStride == 1 && v.pixelStride == 1);
-    const bool interleaved = (u.pixelStride == 2 && v.pixelStride == 2);' \
-  '    const bool planar = false;   // MUTANT: the HAL was asked nothing
-    const bool interleaved = true;' \
+  '                row[2 * c]     = srcU[c * plan.cb.pixelStride];
+                row[2 * c + 1] = srcV[c * plan.cr.pixelStride];' \
+  '                row[2 * c]     = srcU[c * 2];   // MUTANT: the HAL was asked nothing
+                row[2 * c + 1] = srcV[c * 2];' \
   "ignore pixelStride"
 build_planar pc-mutant-pixelstride fail -I"$MP1"
 
@@ -689,10 +743,8 @@ build_planar pc-mutant-pixelstride fail -I"$MP1"
 # byte-by-byte assertion sees it, which is why the harness compares against the source planes.
 MP2=$(fresh_copy_bridge mutant-no-interleave)
 mutate_bridge "$MP2" \
-  '                row[2 * c]     = srcU[c];
-                row[2 * c + 1] = srcV[c];' \
-  '                row[2 * c]     = srcU[c];
-                row[2 * c + 1] = srcU[c];  // MUTANT: the Cr plane is never read' \
+  '                row[2 * c + 1] = srcV[c * plan.cr.pixelStride];' \
+  '                row[2 * c + 1] = srcU[c * plan.cb.pixelStride];  // MUTANT: the Cr plane is never read' \
   "forget to interleave"
 build_planar pc-mutant-no-interleave fail -I"$MP2"
 
@@ -701,10 +753,10 @@ build_planar pc-mutant-no-interleave fail -I"$MP2"
 # end of a Cb plane allocated to exactly its reported limit. That report is the proof.
 MP3=$(fresh_copy_bridge mutant-chroma-luma-stride)
 mutate_bridge "$MP3" \
-  '            const uint8_t* srcU = u.data + r * static_cast<int64_t>(u.rowStride);
-            const uint8_t* srcV = v.data + r * static_cast<int64_t>(v.rowStride);' \
-  '            const uint8_t* srcU = u.data + r * stride;   // MUTANT: the luma stride, as pre-fix
-            const uint8_t* srcV = v.data + r * stride;' \
+  '            const uint8_t* srcU = plan.cb.data + r * static_cast<int64_t>(plan.cb.rowStride);
+            const uint8_t* srcV = plan.cr.data + r * static_cast<int64_t>(plan.cr.rowStride);' \
+  '            const uint8_t* srcU = plan.cb.data + r * stride;   // MUTANT: the luma stride, as pre-fix
+            const uint8_t* srcV = plan.cr.data + r * stride;' \
   "chroma walked with the luma stride"
 build_planar pc-mutant-chroma-luma-stride fail -I"$MP3"
 
@@ -714,7 +766,7 @@ build_planar pc-mutant-chroma-luma-stride fail -I"$MP3"
 MP4=$(fresh_copy_bridge mutant-old-arithmetic)
 mutate_bridge "$MP4" \
   '    const int64_t dataLength = h * stride + chromaRows * stride;' \
-  '    const int64_t dataLength = h * stride + chromaRows * (planar ? (int64_t)u.rowStride : stride);  // MUTANT: pre-fix arithmetic' \
+  '    const int64_t dataLength = h * stride + chromaRows * (plan.layout == Layout::PlanarI420 ? (int64_t)u.rowStride : stride);  // MUTANT: pre-fix arithmetic' \
   "charge with the source uvStride"
 build_planar pc-mutant-old-arithmetic fail -I"$MP4"
 
@@ -727,6 +779,109 @@ mutate_bridge "$MP5" \
   '    uint8_t* uv = dst + h * w;       // MUTANT: the tight NV12 offset, wrong for a padded stride' \
   "UV plane at the wrong offset"
 build_planar pc-mutant-uv-offset fail -I"$MP5"
+
+# ---------------------------------------------------------------------------
+# MQ1..MQ3: the gates that answer the second half of the defect — pixelStride==2 does NOT mean "the U
+# buffer is a complete contiguous NV12 plane". Each mutant restores one of the three guesses the old
+# code made, and each has to die. The anti-vacuity note under MQ1 is the reason the byte oracle in
+# qa/nv12-oracle.h is written from the descriptors rather than from the packer's own decisions.
+# ---------------------------------------------------------------------------
+
+# MQ1: THE DEFECT, restored verbatim — copy the U buffer whenever pixelStride says 2. It dies to ASan
+# on V1, the VU-backed shared buffer: the memcpy reads a full width-byte row from a Cb window that
+# stops at its last Cb sample, i.e. 256 bytes past the end of the plane. Behind that crash sit the two
+# byte-level deaths the same mutant causes and the oracle is written for — V3 (a VU pair whose window
+# does cover the row) and S1/S2 (separate stride-2 allocations), which put the neighbour's Cr, or the
+# HAL's own 0xFF padding, into every Cr slot. qa/build-host.sh scores the mutant as dead either way;
+# the same two byte patterns are on record against the pre-fix packer in the pc-on-prepacker run.
+MQ1=$(fresh_copy_bridge mutant-copy-u-on-pixelstride)
+mutate_bridge "$MQ1" \
+  '    if (plan.verbatimU) {' \
+  '    if (u.pixelStride == 2) {  // MUTANT: pixelStride is the whole answer, as it used to be' \
+  "copy the U buffer on pixelStride alone"
+build_planar pc-mutant-copy-u-on-pixelstride fail -I"$MQ1"
+
+# MQ2: the VU pair read in the wrong order — planes[1] is Cb because the CONTRACT says so, but this
+# mutant takes the byte the HAL happened to put first. Cb lands in the Cr slots and vice versa; the
+# fixture keeps the two components in disjoint value ranges precisely so this cannot pass.
+MQ2=$(fresh_copy_bridge mutant-vu-ordering)
+mutate_bridge "$MQ2" \
+  '        plan->cb = u;   // MQ2 anchor: exchanging these two lines is the VU ordering defect — Cb is the
+        plan->cr = v;   // byte the HAL pointed planes[1] at, whichever half of the pair that happens to be' \
+  '        plan->cb = v;   // MUTANT: whichever byte of the pair came first, called it Cb
+        plan->cr = u;' \
+  "read a VU-backed pair in UV order"
+build_planar pc-mutant-vu-ordering fail -I"$MQ2"
+
+# MQ3: only the U window is bounded — the exact shape of the old code, which validated U and then
+# copied U, and never looked at the V buffer at all. It is killed by D7 alone: the packer's promise is
+# "nothing is read outside the plane's own window", and with the check gone the last Cr is read from
+# outside the window while still sitting inside the allocation, so no ASan report is available and the
+# named refusal is the only evidence there is. (A read outside the ALLOCATION is defect (2)'s shape,
+# and jb-mutant-no-admission is where that one is proven by ASan.)
+MQ3=$(fresh_copy_bridge mutant-bound-only-u)
+mutate_bridge "$MQ3" \
+  '    const Bound bounds[2] = { { "Cb", &plan.cb }, { "Cr", &plan.cr } };' \
+  '    const Bound bounds[1] = { { "Cb", &plan.cb } };  // MUTANT: the V buffer is never asked how long it is' \
+  "bound only the Cb window"
+build_planar pc-mutant-bound-only-cr fail -I"$MQ3"
+
+# WITHDRAWN MUTANT — recorded here so nobody re-adds it and calls the result evidence.
+#
+# The candidate was uWindowIsTheWholePlane() -> `return true`, i.e. drop the "the window reaches the
+# last byte of the last pair" condition from the memcpy fast path. It is EQUIVALENT, and here is the
+# proof by exhaustion rather than by hope: the function is called from exactly one place, the off==+1
+# branch of planChroma(), which has already proved the two planes share one allocation. Every case
+# that reaches it (A, A2, C1, C2, T1) has a shared chroma allocation whose union of the two reported
+# windows covers the full last row — so the forced memcpy reads only bytes that planes[2]'s own window
+# already guarantees, and it writes the same bytes the per-sample path would have written. No
+# assertion can distinguish the two, and ASan cannot either, because the read is inside the image.
+# What IS load-bearing about that condition is its false branch, and T1 pins it: a Cb view trimmed to
+# its last sample must still be ACCEPTED (the pre-fix packer refused that frame outright). An
+# assertion that cannot fail is worse than no assertion — it is the reason the suite would then
+# survive the bug it was written for.
+
+echo
+echo "== jni-boundary: the bridge may only read what the buffer it was handed actually holds =="
+# The scenario links the REAL app/src/main/cpp/OMTBridge.cpp — not a transcription of it — against
+# qa/host-jni/jni.h, over the real sender and the real codec. Its *Size arguments are caller-supplied
+# ints, and every bounds check the packer has trusts them; only GetDirectBufferCapacity() does not.
+build_jni jb-fixed pass "$ROOT/app/src/main/cpp/OMTBridge.cpp"
+
+# JB1: the admission loop removed. The claims in B1..B12 then reach the packer, whose checks are all
+# `claimed >= need`, and the reads walk past plane allocations malloc'd to exactly the capacity the
+# bridge was shown. The ASan heap-buffer-overflow READ inside packNv12 is the verdict — that report,
+# not an assertion, is the proof the read was real.
+JB1=$(fresh_copy_jni mutant-jni-no-admission)
+mutate_jni "$JB1" OMTBridge.cpp \
+  '    for (int i = 0; i < 3; ++i) {
+        if (!omtpack::admitSource(claims[i], planeNames[i], why, static_cast<int>(sizeof(why)))) {' \
+  '    for (int i = 0; i < 0; ++i) {   // MUTANT: the caller word is good enough, as it used to be
+        if (!omtpack::admitSource(claims[i], planeNames[i], why, static_cast<int>(sizeof(why)))) {' \
+  "never vet the caller's lengths"
+build_jni jb-mutant-no-admission fail "$JB1/OMTBridge.cpp"
+
+# JB2: the comparison off by one. A claim one byte above the capacity then passes, which is the
+# smallest lie that still produces an out-of-bounds read (B1/B2/B3 and B9..B12 are exactly it). This
+# mutant is what proves the gate is `>` and not `>=`: without it, "refuse everything" would satisfy
+# the same scenarios.
+JB2=$(fresh_copy_jni mutant-jni-off-by-one)
+mutate_jni "$JB2" omtnv12.h \
+  '    if (c.claimed > c.capacity) {' \
+  '    if (c.claimed > c.capacity + 1) {  // MUTANT: one byte of trust is still trust' \
+  "vet the claims with an off-by-one"
+build_jni jb-mutant-off-by-one fail "$JB2/OMTBridge.cpp"
+
+# JB3: the negative-length clause removed. A negative claim is not merely rude — it is the operand of
+# every `claimed >= need` comparison in the packer, so it must be refused where the refusal can name
+# the buffer. Without it the frame is refused lower down, by a message about sizes, and the operator
+# reading logcat cannot tell a short plane from a lie about one.
+JB3=$(fresh_copy_jni mutant-jni-no-negative)
+mutate_jni "$JB3" omtnv12.h \
+  '    if (c.claimed < 0) {' \
+  '    if (false) {  // MUTANT: a negative length is just a very large need' \
+  "stop refusing negative lengths by name"
+build_jni jb-mutant-no-negative fail "$JB3/OMTBridge.cpp"
 
 # Channel scenarios, with the HEADERS taken from the same copy as the sources. build_and_run resolves
 # includes against the tree, which is fine while a mutant changes only .cpp; here the pre-fix copy

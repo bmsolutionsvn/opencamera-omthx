@@ -232,11 +232,45 @@ Java_net_sourceforge_opencamera_OMTSender_nativeSendFramePlanes(
         return JNI_FALSE;
     }
 
+    /* ---- vet the caller's three length claims against the buffers they came from ----
+     *
+     * ySize/uSize/vSize arrive as plain ints, and every bounds check inside packNv12() is of the form
+     * `plane.size >= need`: they measure the geometry against the CALLER's word, not against memory.
+     * A Java side that computed the length from its own idea of the plane (rather than passing
+     * getBuffer().limit()), a buffer reused after a resize, or a future refactor that forgets to
+     * re-read the Image would each hand over a number bigger than the allocation, and the packer's
+     * checks would all nod and then read past the end of it. The destination was never allowed to lie
+     * like this — GetDirectBufferCapacity(dstBuffer) is what gates it — so make the sources answer to
+     * the same authority. The JVM knows how long each buffer is; ask the JVM, not Java.
+     *
+     * This must run before the first read, and it must say which buffer it refused. */
+    const int64_t yCap = env->GetDirectBufferCapacity(yBuffer);
+    const int64_t uCap = env->GetDirectBufferCapacity(uBuffer);
+    const int64_t vCap = env->GetDirectBufferCapacity(vBuffer);
+
+    omtpack::Result packed{};
+    char why[256] = {};
+    const omtpack::SourceClaim claims[3] = {
+        omtpack::SourceClaim{yp, ySize, yCap},
+        omtpack::SourceClaim{up, uSize, uCap},
+        omtpack::SourceClaim{vp, vSize, vCap},
+    };
+    const char* const planeNames[3] = { "Y plane (planes[0])", "Cb plane (planes[1])",
+                                        "Cr plane (planes[2])" };
+    for (int i = 0; i < 3; ++i) {
+        if (!omtpack::admitSource(claims[i], planeNames[i], why, static_cast<int>(sizeof(why)))) {
+            LOGE("Frame refused before packing: %s (y: row=%d pix=%d size=%lld cap=%lld; "
+                 "u: row=%d pix=%d size=%lld cap=%lld; v: row=%d pix=%d size=%lld cap=%lld; %dx%d)",
+                 why, yRowStride, yPixelStride, (long long)ySize, (long long)yCap,
+                 uRowStride, uPixelStride, (long long)uSize, (long long)uCap,
+                 vRowStride, vPixelStride, (long long)vSize, (long long)vCap, width, height);
+            return JNI_FALSE;
+        }
+    }
+
     omtpack::Plane y{yp, ySize, yRowStride, yPixelStride};
     omtpack::Plane u{up, uSize, uRowStride, uPixelStride};
     omtpack::Plane v{vp, vSize, vRowStride, vPixelStride};
-    omtpack::Result packed{};
-    char why[192] = {};
 
     if (!omtpack::packNv12(y, u, v, width, height, dst,
                            env->GetDirectBufferCapacity(dstBuffer), &packed,
