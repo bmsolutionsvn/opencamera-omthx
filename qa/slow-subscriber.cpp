@@ -137,8 +137,14 @@ int main() {
     std::printf("      frames accepted by the pool: %d/16, slowest producer call %ld ms\n",
                 acceptedFrames, worstProducerMs);
     ok(worstProducerMs < 50, "the producer was never blocked by the stalled subscriber");
-    ok(acceptedFrames > 0 && acceptedFrames < 16,
-       "the bounded pool dropped the overflow instead of growing without limit");
+    // The ring is 4 buffers. Under the original drop-newest policy the 5th call returned 0; under
+    // drop-oldest every call is admitted and an older queued frame is evicted instead, so "was it
+    // accepted" is no longer the question. The invariants that matter are that the producer is
+    // never blocked, the newest frame always wins a slot, and the excess is EVICTED AND COUNTED
+    // rather than silently accumulating — that is what keeps memory bounded at 4 buffers.
+    ok(acceptedFrames == 16, "the newest frame is always admitted (the producer is never refused)");
+    ok(ch->staleEvicted() >= 16 - Constants::NETWORK_ASYNC_COUNT,
+       "the overflow was evicted from the queue and counted, not accumulated");
 
     // ---- G1: the wedged subscriber must be EVICTED, not waited on ---------------------------
     // Before the fix this never happened: sendAllBlocking sat in send() forever, and because

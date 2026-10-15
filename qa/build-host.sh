@@ -106,5 +106,31 @@ PY
 build_and_run cs-mutant-count "$ROOT/qa/colorspace-gate.cpp" "$M2" fail
 
 echo
+echo "== drop-policy: when the ring is full, the newest frame must be the one that survives =="
+build_and_run dp-fixed "$ROOT/qa/drop-policy.cpp" "$ROOT/libomt/cpp" pass
+
+M3=$(fresh_copy mutant-keep-oldest)
+python3 - "$M3/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "            if (!pendingQueue_.empty()) { stale = pendingQueue_.front(); pendingQueue_.pop(); }"
+assert s.count(old) == 1, "evict-oldest not found"
+# the original policy: keep what is queued, drop the frame in hand
+open(p, "w").write(s.replace(old, "            if (false) { stale = pendingQueue_.front(); pendingQueue_.pop(); }", 1))
+PY
+build_and_run dp-mutant-keep-oldest "$ROOT/qa/drop-policy.cpp" "$M3" fail
+
+M4=$(fresh_copy mutant-blind-drops)
+python3 - "$M4/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    const int64_t delta = total - drops_baseline_.exchange(total);"
+assert s.count(old) == 1, "drop window not found"
+# the state before this commit: the C entry point returned a hardcoded 0
+open(p, "w").write(s.replace(old, "    const int64_t delta = 0; (void)total;", 1))
+PY
+build_and_run dp-mutant-blind "$ROOT/qa/drop-policy.cpp" "$M4" fail
+
+echo
 if [ $rc -ne 0 ]; then echo "QA FAILED"; exit 1; fi
 echo "QA PASSED (every gate has a scenario where disabling it turns the suite red)"

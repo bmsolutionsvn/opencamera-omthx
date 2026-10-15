@@ -73,6 +73,10 @@ public:
     
     // Connection state
     bool isConnected() const { return connected_.load(); }
+    int64_t framesDropped() const { return framesDropped_.load(); }
+    int64_t framesSent() const { return framesSent_.load(); }
+    int64_t staleEvicted() const { return staleEvicted_.load(); }
+    int64_t tornSends() const { return tornSends_.load(); }
     void disconnect();
     
     // Subscriptions
@@ -130,6 +134,10 @@ private:
     // Statistics
     std::atomic<int64_t> framesSent_{0};
     std::atomic<int64_t> framesDropped_{0};
+    /// Queued frames evicted to make room for a newer one (see sendAsync drop-oldest).
+    std::atomic<int64_t> staleEvicted_{0};
+    /// Writes that began and failed partway — a distinct failure mode from a clean drop.
+    std::atomic<int64_t> tornSends_{0};
     std::atomic<int64_t> bytesSent_{0};
     std::atomic<int64_t> bytesReceived_{0};
     

@@ -113,6 +113,8 @@ public:
     }
     /// Frames the encoder refused. Without this they left the camera and were counted nowhere.
     long long encodeFailures() const { return encodeFailures_.load(); }
+    /// Drops across all subscribers since the previous call (per-second congestion view).
+    int64_t getRecentDropsAndReset();
     
     /**
      * Send metadata to all connected clients
@@ -189,6 +191,7 @@ private:
     std::atomic<int64_t> totalEncodedBytes_{0};
     std::atomic<int> frameCount_{0};
     std::atomic<int64_t> encodeFailures_{0};
+    std::atomic<int64_t> drops_baseline_{0};
     // Written by whichever thread failed a send, read by the UI's stats poll — so it needs its own
     // lock rather than riding on channelsMutex_, which the fan-out path holds while it queues.
     mutable std::mutex errorMutex_;

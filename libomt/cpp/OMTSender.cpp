@@ -161,6 +161,21 @@ void Sender::removeChannel(Channel* channel) {
     }
 }
 
+int64_t Sender::getRecentDropsAndReset() {
+    // omt_send_get_recent_drops_and_reset() was a stub that returned 0 with a comment saying it
+    // "would need to track in Sender". The consequence: OMTStreamingManager's whole 1-second
+    // congestion alert (onFramesDropped) was unreachable code — the UI could never tell the user
+    // that the stream was dropping frames. Sum the live channels and compare against the baseline
+    // taken at the previous call, so a caller polling once a second sees per-second drops.
+    int64_t total = 0;
+    {
+        std::lock_guard<std::mutex> lock(channelsMutex_);
+        for (const auto& ch : channels_) total += ch->framesDropped();
+    }
+    const int64_t delta = total - drops_baseline_.exchange(total);
+    return delta > 0 ? delta : 0;
+}
+
 void Sender::cleanupDisconnected() {
     // Same rule as removeChannel: unlink fast, join outside the critical section.
     std::vector<std::shared_ptr<Channel>> doomed;
