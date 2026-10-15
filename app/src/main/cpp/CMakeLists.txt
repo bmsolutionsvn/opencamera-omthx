@@ -192,15 +192,19 @@ file(GLOB_RECURSE OMT_PROVENANCE_INPUTS CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/CMakeLists.txt
      ${CMAKE_CURRENT_SOURCE_DIR}/cmake/*.cmake)
 
-add_custom_command(OUTPUT ${OMT_PROVENANCE_CPP}
+add_custom_target(omt_provenance_generate ALL
     COMMAND ${CMAKE_COMMAND}
         -DOMT_REPO_ROOT=${OMT_REPO_ROOT}
         -DOMT_ABI=${ANDROID_ABI}
         -DOMT_OUT=${OMT_PROVENANCE_CPP}
         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenProvenance.cmake
+    BYPRODUCTS ${OMT_PROVENANCE_CPP}
     DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/cmake/GenProvenance.cmake ${OMT_PROVENANCE_INPUTS}
     VERBATIM)
-add_custom_target(omt_provenance_generate DEPENDS ${OMT_PROVENANCE_CPP})
+# Deliberately an ALL target with no OUTPUT: git state (the revision, and whether the tree is
+# dirty) can change without any source file's content changing, and a stamp that is only refreshed
+# when a source is edited would keep asserting the revision it was first generated against. The
+# script leaves the file alone when the stamp is unchanged, so this does not force a relink.
 set_source_files_properties(${OMT_PROVENANCE_CPP} PROPERTIES GENERATED TRUE)
 
 foreach(_omt_lib vmx omt omtbridge)
