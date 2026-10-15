@@ -215,8 +215,6 @@ public class BluetoothRemoteControl {
     };
 
     public boolean remoteConnected() {
-		/*if( true )
-			return true; // test*/
         return is_connected;
     }
 
@@ -303,7 +301,6 @@ public class BluetoothRemoteControl {
         boolean remote_enabled = sharedPreferences.getBoolean(PreferenceKeys.EnableRemote, false);
         remoteDeviceType = sharedPreferences.getString(PreferenceKeys.RemoteType, "undefined");
         remoteDeviceAddress = sharedPreferences.getString(PreferenceKeys.RemoteName, "undefined");
-        //return remote_enabled; // test - if using this, also need to enable test code in BluetoothLeService.connect()
         return remote_enabled && !remoteDeviceAddress.equals("undefined");
     }
 }

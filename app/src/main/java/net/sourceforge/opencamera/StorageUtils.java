@@ -608,6 +608,66 @@ public class StorageUtils {
         return file;
     }
 
+    /** Checks whether a third-party-supplied output Uri (MediaStore.EXTRA_OUTPUT on
+     *  ACTION_IMAGE_CAPTURE / ACTION_VIDEO_CAPTURE) is safe for this app to write to.
+     *  The writing happens with this app's own permissions - ContentResolver.openOutputStream
+     *  / openFileDescriptor on a file:// Uri, or via a content provider - so a malicious
+     *  caller can otherwise use us as a confused deputy to overwrite files we own: its
+     *  EXTRA_OUTPUT can point inside our private data directory (shared_prefs, databases)
+     *  and the capture data lands on top of them. Such URIs are refused and the caller
+     *  falls back to the standard save location.
+     *  Everything else keeps working: content:// URIs we cannot resolve to a path (e.g. the
+     *  caller's own FileProvider, MediaStore entries without a _data column) are allowed -
+     *  the write then happens against the caller's provider, which owns the target; file://
+     *  URIs outside our data directory (legacy external-storage output) are allowed.
+     */
+    boolean isUriSafe(Uri uri) {
+        if( MyDebug.LOG )
+            Log.d(TAG, "isUriSafe: " + uri);
+        if( uri == null )
+            return false; // nothing to write to is never "safe to write to"
+        String scheme = uri.getScheme();
+        String path = null;
+        if( scheme != null && scheme.equalsIgnoreCase("file") ) {
+            path = uri.getPath();
+        }
+        else if( scheme != null && scheme.equalsIgnoreCase("content") ) {
+            // best-effort resolution; getDataColumn swallows query failures and returns null
+            path = getDataColumn(uri, null, null);
+        }
+        if( path == null )
+            return true; // cannot resolve to a filesystem path - caller's provider owns the write
+        return isOutputPathSafe(path, context.getApplicationInfo().dataDir);
+    }
+
+    /** Pure decision half of isUriSafe: no android.* calls, so unit tests can drive it
+     *  against a real filesystem (they must - the attack is a real overwrite attempt).
+     *  Returns false if path resolves (after '..' and symlink resolution) to the application's
+     *  private data directory itself or anything inside it.
+     */
+    static boolean isOutputPathSafe(String path, String dataDir) {
+        if( path == null || dataDir == null )
+            return true; // cannot check - do not break legitimate flows
+        try {
+            String canonicalPath = new File(path).getCanonicalPath();
+            String canonicalDataDir = new File(dataDir).getCanonicalPath();
+            if( canonicalPath.equals(canonicalDataDir) )
+                return false;
+            // trailing separator: /data/data/com.foo must not match /data/data/com.foobar
+            if( !canonicalDataDir.endsWith(File.separator) )
+                canonicalDataDir += File.separator;
+            if( canonicalPath.startsWith(canonicalDataDir) )
+                return false;
+        }
+        catch(IOException e) {
+            // canonical path unavailable - a path with traversal segments that we cannot
+            // disambiguate is not acceptable from an untrusted caller
+            if( path.contains("..") )
+                return false;
+        }
+        return true;
+    }
+
     private String getDataColumn(Uri uri, String selection, String [] selectionArgs) {
         final String column = MediaStore.Images.ImageColumns.DATA;
         final String[] projection = {
@@ -680,12 +740,38 @@ public class StorageUtils {
         return result;
     }
 
+    /** Sanitizes a user-supplied string for use as the prefix of a media filename.
+     *  The prefix comes from a preference (PreferenceKeys.SavePhotoPrefixPreferenceKey /
+     *  SaveVideoPrefixPreferenceKey), is concatenated straight into the filename, and the
+     *  filename is later resolved against the save directory (StorageUtils.createOutputMediaFile)
+     *  or handed to MediaStore as DISPLAY_NAME - path separators would let a crafted prefix such
+     *  as "../../shared_prefs/evil" escape the intended folder, e.g. into the app's private data
+     *  directory. Replacing separators with '_' keeps the file in the intended folder while
+     *  preserving the rest of the prefix verbatim.
+     */
+    public static String sanitizeFilenamePrefix(String prefix) {
+        if( prefix == null )
+            return "";
+        // we can't have slashes in the filename
+        prefix = prefix.replace('/', '_');
+        prefix = prefix.replace('\\', '_');
+        return prefix;
+    }
+
     String createMediaFilename(int type, String suffix, int count, String extension, Date current_date) {
+        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context);
+        return createMediaFilename(type, suffix, count, extension, current_date, sharedPreferences);
+    }
+
+    /** Overload taking the SharedPreferences explicitly, so unit tests can drive the
+     *  preference-derived filename handling without a live Context/PreferenceManager.
+     */
+    String createMediaFilename(int type, String suffix, int count, String extension, Date current_date,
+            SharedPreferences sharedPreferences) {
         String index = "";
         if( count > 0 ) {
             index = "_" + count; // try to find a unique filename
         }
-        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context);
         boolean useZuluTime = sharedPreferences.getString(PreferenceKeys.SaveZuluTimePreferenceKey, "local").equals("zulu");
         boolean includeMilliseconds = sharedPreferences.getBoolean(PreferenceKeys.SaveIncludeMillisecondsPreferenceKey, false);
         String dateFormatPattern = "yyyyMMdd_HHmmss";
@@ -707,11 +793,13 @@ public class StorageUtils {
             case MEDIA_TYPE_PRESHOT: // preshot videos still use same prefix as photos
             case MEDIA_TYPE_IMAGE: {
                 String prefix = sharedPreferences.getString(PreferenceKeys.SavePhotoPrefixPreferenceKey, "IMG_");
+                prefix = sanitizeFilenamePrefix(prefix);
                 mediaFilename = prefix + timeStamp + suffix + index + extension;
                 break;
             }
             case MEDIA_TYPE_VIDEO: {
                 String prefix = sharedPreferences.getString(PreferenceKeys.SaveVideoPrefixPreferenceKey, "VID_");
+                prefix = sanitizeFilenamePrefix(prefix);
                 mediaFilename = prefix + timeStamp + suffix + index + extension;
                 break;
             }

@@ -337,7 +337,16 @@ public class MyApplicationInterface extends BasicApplicationInterface {
                 if (intent_uri != null) {
                     if (MyDebug.LOG)
                         Log.d(TAG, "save to: " + intent_uri);
-                    return VideoMethod.URI;
+                    if (!storageUtils.isUriSafe(intent_uri)) {
+                        // The calling app may not point us at our own private data directory -
+                        // MediaRecorder writes with our permissions (see StorageUtils.isUriSafe).
+                        // Fall back to the standard save location, exactly as if EXTRA_OUTPUT
+                        // had been absent.
+                        Log.e(TAG, "refusing to save video to unsafe intent_uri: " + intent_uri);
+                        intent_uri = null;
+                    } else {
+                        return VideoMethod.URI;
+                    }
                 }
             }
             // if no EXTRA_OUTPUT, we should save to standard location, and will pass back
@@ -3679,6 +3688,14 @@ public class MyApplicationInterface extends BasicApplicationInterface {
             Bundle myExtras = main_activity.getIntent().getExtras();
             if (myExtras != null) {
                 image_capture_intent_uri = myExtras.getParcelable(MediaStore.EXTRA_OUTPUT);
+                if (image_capture_intent_uri != null && !storageUtils.isUriSafe(image_capture_intent_uri)) {
+                    // Same confused-deputy guard as createOutputVideoMethod(): ImageSaver writes
+                    // this Uri with our permissions (ContentResolver.openOutputStream), so a
+                    // malicious caller must not be able to point it inside our private data
+                    // directory. Treating it as absent saves to the standard location instead.
+                    Log.e(TAG, "refusing to save image to unsafe intent_uri: " + image_capture_intent_uri);
+                    image_capture_intent_uri = null;
+                }
                 if (MyDebug.LOG)
                     Log.d(TAG, "save to: " + image_capture_intent_uri);
             }
