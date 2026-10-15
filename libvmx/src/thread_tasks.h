@@ -127,6 +127,13 @@ static void DestroyTasks(ThreadTasks* tasks)
 			ThreadTask* task = tasks->tasks[i];
 			delete task;
 		}
+		// CreateTasks allocates three things: the struct, the ThreadTask*[] array, and each task.
+		// This function freed two of them, so the array leaked — 16 bytes per VMX_Create, and
+		// Sender::createEncoder() calls VMX_Create again on every resolution change. ASan caught it
+		// in qa/build-host.sh; the desktop vendored copy of this same file (nodos-yded-linux
+		// plugins/yd.net.ompout/vendor/libvmx/src/thread_tasks.h:123) already had this line.
+		delete[] tasks->tasks;
+		tasks->tasks = nullptr;
 		delete tasks;
 	}
 }
