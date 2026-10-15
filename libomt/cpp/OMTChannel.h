@@ -12,6 +12,7 @@
 #define OMT_CHANNEL_H
 
 #include <atomic>
+#include <string>
 #include <queue>
 #include <mutex>
 #include <thread>
@@ -148,6 +149,8 @@ private:
     // Socket helpers
     void setSendBuffer(int size);
     void closeSocket();
+    /// Writes the whole buffer or gives up after timeoutMs; never leaves the fd blocking.
+    bool sendWithDeadline(const uint8_t* data, size_t length, int timeoutMs);
 };
 
 } // namespace omt

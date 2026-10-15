@@ -78,12 +78,22 @@ namespace VideoFlags {
     constexpr int32_t Preview = 8;
 }
 
-// Color space
+// Colour space — the values that go into VideoExtHeader::colorSpace.
+//
+// These are NOT 0/1/2/3. The wire carries the OMTColorSpace numbering from libomt/libomt.h:112-115
+// (0, 601, 709), which is what VMX_COLORSPACE in libvmx/src/vmxcodec.h:84-88 also uses, and what
+// every conforming receiver (libomtnet's OMTAddress/OMTReceive, OBS) expects to read back. An
+// earlier version of this block said BT601 = 1, BT709 = 2 — a second, contradictory numbering
+// sitting inside the very header that defines the wire struct, so writing the obvious
+// `extHeader.colorSpace = ColorSpace::BT709` emitted 2 and every receiver saw a colour space that
+// does not exist. The app avoided visible breakage only because OMTBridge.cpp takes its values
+// from the C enum instead of from here. qa/colorspace-gate.cpp asserts these numbers now.
 namespace ColorSpace {
-    constexpr int32_t Unknown = 0;
-    constexpr int32_t BT601 = 1;
-    constexpr int32_t BT709 = 2;
-    constexpr int32_t BT2020 = 3;
+    constexpr int32_t Undefined = 0;
+    constexpr int32_t BT601 = 601;
+    constexpr int32_t BT709 = 709;
+    // BT.2020 is defined by the spec but cannot be encoded: VMX_Create only knows 0/601/709, so
+    // Sender::send refuses it rather than shipping a header that misdescribes the payload.
 }
 
 } // namespace omt
