@@ -104,9 +104,14 @@ public class OMTSender {
      * 
      * The buffer should contain NV12 formatted pixel data (Y plane followed by UV
      * plane).
-     * This is the native format from Android's Camera2 API with
-     * ImageFormat.YUV_420_888.
-     * 
+     *
+     * @deprecated ImageFormat.YUV_420_888 does not guarantee that layout — the chroma plane is
+     *             interleaved (NV12) or planar (I420) depending on what the HAL reports, and a
+     *             Camera2 device whose two row strides differ used to be refused by the sender's
+     *             own gate on every frame. Callers holding an {@link android.media.Image} want
+     *             {@link #sendFramePlanes}; this entry point now refuses a buffer whose capacity
+     *             cannot honour {@code stride*height*3/2} rather than shipping the mismatch.
+     *
      * @param buffer   Direct ByteBuffer containing NV12 pixel data
      * @param width    Frame width
      * @param height   Frame height
@@ -114,6 +119,7 @@ public class OMTSender {
      * @param uvStride Stride of the UV plane
      * @return true if frame was sent successfully
      */
+    @Deprecated
     public boolean sendFrame(ByteBuffer buffer, int width, int height, int yStride, int uvStride) {
         if (!isInitialized) {
             Log.e(TAG, "Cannot send frame: OMTSender not initialized");
@@ -126,6 +132,72 @@ public class OMTSender {
         }
 
         return nativeSendFrame(buffer, width, height, yStride, uvStride);
+    }
+
+    /**
+     * Bytes of NV12 a destination buffer must hold for a frame whose luma rowStride is
+     * {@code yRowStride}. Same arithmetic as {@code omtpack::nv12Size} in
+     * app/src/main/cpp/omtnv12.h — the packer declares the stride, the caller allocates for it.
+     *
+     * @return the size, or -1 if the geometry is not packable (non-positive, or too large for a
+     *         direct ByteBuffer / the sender's int length field)
+     */
+    public static long nv12BufferSize(int yRowStride, int height) {
+        if (yRowStride <= 0 || height <= 0) return -1;
+        long s = yRowStride, h = height;
+        long bytes = h * s + (h / 2) * s;
+        if (bytes <= 0 || bytes > Integer.MAX_VALUE) return -1;
+        return bytes;
+    }
+
+    /**
+     * Send one Camera2 {@code ImageFormat.YUV_420_888} frame, whatever chroma layout its HAL chose.
+     *
+     * The three planes go over as the Image described them; the native side reads each one with its
+     * OWN rowStride and pixelStride, interleaves Cb/Cr when the chroma is planar (pixelStride==1),
+     * and hands the encoder a buffer whose length is exactly {@code stride*height*3/2} — the number
+     * the encoder is documented to read. A device that reports NV12 (pixelStride==2) takes the
+     * verbatim-copy path and sees the same bytes on the wire as before.
+     *
+     * @param dst        Direct ByteBuffer of at least {@link #nv12BufferSize} bytes, reused per frame
+     * @param y/u/v      the plane buffers from {@code Image.Plane.getBuffer()}, position 0
+     * @param *Size      the readable bytes of that plane ({@code getBuffer().limit()})
+     * @param *RowStride / *PixelStride from the same {@code Image.Plane}
+     * @return true if the frame was packed and at least one receiver took it
+     */
+    public boolean sendFramePlanes(ByteBuffer dst,
+                                   ByteBuffer y, int ySize, int yRowStride, int yPixelStride,
+                                   ByteBuffer u, int uSize, int uRowStride, int uPixelStride,
+                                   ByteBuffer v, int vSize, int vRowStride, int vPixelStride,
+                                   int width, int height) {
+        if (!isInitialized) {
+            Log.e(TAG, "Cannot send frame: OMTSender not initialized");
+            return false;
+        }
+        if (dst == null || y == null || u == null || v == null) {
+            Log.e(TAG, "Cannot send frame: a plane buffer is null");
+            return false;
+        }
+        if (!dst.isDirect() || !y.isDirect() || !u.isDirect() || !v.isDirect()) {
+            Log.e(TAG, "Cannot send frame: plane buffers must all be direct ByteBuffers");
+            return false;
+        }
+        if (y.position() != 0 || u.position() != 0 || v.position() != 0) {
+            // The native side addresses the allocation base, so a positioned buffer would be read
+            // from the wrong offset. Refuse it rather than encode the wrong pixels.
+            Log.e(TAG, "Cannot send frame: plane buffers must be positioned at 0");
+            return false;
+        }
+        if (dst.capacity() < nv12BufferSize(yRowStride, height)) {
+            Log.e(TAG, "Cannot send frame: destination buffer " + dst.capacity()
+                    + " is smaller than the packed NV12 size for stride=" + yRowStride
+                    + " height=" + height);
+            return false;
+        }
+
+        return nativeSendFramePlanes(dst, y, ySize, yRowStride, yPixelStride,
+                                     u, uSize, uRowStride, uPixelStride,
+                                     v, vSize, vRowStride, vPixelStride, width, height);
     }
 
     /**
@@ -226,6 +298,12 @@ public class OMTSender {
     private native boolean nativeInit(String name, int width, int height, int frameRateN, int frameRateD, int quality);
 
     private native boolean nativeSendFrame(ByteBuffer buffer, int width, int height, int yStride, int uvStride);
+
+    private native boolean nativeSendFramePlanes(ByteBuffer dst,
+                                                 ByteBuffer y, int ySize, int yRowStride, int yPixelStride,
+                                                 ByteBuffer u, int uSize, int uRowStride, int uPixelStride,
+                                                 ByteBuffer v, int vSize, int vRowStride, int vPixelStride,
+                                                 int width, int height);
 
     private native int nativeGetConnectionCount();
 

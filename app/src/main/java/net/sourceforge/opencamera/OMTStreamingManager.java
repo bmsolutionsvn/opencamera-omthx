@@ -358,54 +358,92 @@ public class OMTStreamingManager {
         }
     };
 
+    private int sentFrameCount = 0;
+    private int sendFailureCount = 0;
+
     /**
      * Send a frame to the OMT sender.
-     * Converts YUV_420_888 format to the NV12 format expected by OMT.
+     *
+     * YUV_420_888 is a description of three planes, not a memory layout: the HAL decides whether
+     * the chroma is interleaved (NV12, planes[1].getPixelStride()==2, one CbCrCr... buffer whose row
+     * is width bytes) or planar (I420, pixelStride()==1, separate Cb and Cr planes whose rows are
+     * width/2 bytes). This method used to copy planes[1] verbatim behind the luma plane and call the
+     * result NV12, which on a planar device — the emulator included, measured at 1920x1080 with
+     * y rowStride=1920 and chroma rowStride=960, pixelStride=1 — produced a buffer the sender's own
+     * gate refused on every frame:
+     *
+     *   E omt-sender: Sender::send: frame rejected: buffer too small for NV12 1920x1080 stride=1920:
+     *   the encoder reads 3110400 bytes, dataLength is 2592000
+     *
+     * 2592000 is 1080*1920 + 540*960: the chroma plane charged at its own half-width row while the
+     * encoder walks it at the luma stride. The planes are now handed to the native packer
+     * (app/src/main/cpp/omtnv12.h) as the Image described them; it reads each one with its OWN
+     * rowStride/pixelStride, interleaves Cb/Cr when the layout is planar, and reports the geometry
+     * it really wrote, so the length the sender is told and the bytes the encoder reads agree.
      */
-    private int sentFrameCount = 0;
-
     private void sendFrame(Image image) {
         if (omtSender == null || !isStreaming) {
             return;
         }
 
-        // Get Y and U planes (U plane for NV12 interleaved UV)
-        Image.Plane yPlane = image.getPlanes()[0];
-        Image.Plane uPlane = image.getPlanes()[1];
+        Image.Plane[] planes = image.getPlanes();
+        if (planes.length < 3) {
+            Log.e(TAG, "sendFrame: YUV_420_888 image reported " + planes.length + " planes, refusing it");
+            return;
+        }
+        Image.Plane yPlane = planes[0];
+        Image.Plane uPlane = planes[1];
+        Image.Plane vPlane = planes[2];
 
-        int yStride = yPlane.getRowStride();
-        int uvStride = uPlane.getRowStride();
-        int ySize = yStride * image.getHeight();
-        int uvSize = uvStride * (image.getHeight() / 2);
-        int totalSize = ySize + uvSize;
+        int width = image.getWidth();
+        int height = image.getHeight();
+        int yRowStride = yPlane.getRowStride();
+        long packedSize = OMTSender.nv12BufferSize(yRowStride, height);
+        if (packedSize < 0) {
+            Log.e(TAG, "sendFrame: cannot size a packed NV12 buffer for stride=" + yRowStride
+                    + " height=" + height + ", refusing the frame");
+            return;
+        }
 
         sentFrameCount++;
         if (DEBUG_LOGS && sentFrameCount % 30 == 1) {
-            Log.d(TAG, "sendFrame #" + sentFrameCount + ": " + image.getWidth() + "x" + image.getHeight() +
-                    ", yStride=" + yStride + ", uvStride=" + uvStride + ", totalSize=" + totalSize);
+            Log.d(TAG, "sendFrame #" + sentFrameCount + ": " + width + "x" + height
+                    + ", y row=" + yRowStride + "/" + yPlane.getPixelStride()
+                    + ", u row=" + uPlane.getRowStride() + "/" + uPlane.getPixelStride()
+                    + ", v row=" + vPlane.getRowStride() + "/" + vPlane.getPixelStride()
+                    + ", packedSize=" + packedSize);
         }
 
-        // Allocate or resize frame buffer if needed
-        if (frameBuffer == null || frameBuffer.capacity() < totalSize) {
-            frameBuffer = ByteBuffer.allocateDirect(totalSize);
-            Log.d(TAG, "Allocated frame buffer: " + totalSize + " bytes");
+        // Allocate or resize the packed-NV12 buffer if needed. It is written and read natively by
+        // address (no Java put/flip), so its position and limit carry no meaning here.
+        if (frameBuffer == null || frameBuffer.capacity() < packedSize) {
+            frameBuffer = ByteBuffer.allocateDirect((int) packedSize);
+            Log.d(TAG, "Allocated frame buffer: " + packedSize + " bytes");
         }
-
-        // Copy Y and UV planes into the frame buffer
-        frameBuffer.clear();
 
         ByteBuffer yBuffer = yPlane.getBuffer();
         yBuffer.rewind();
-        frameBuffer.put(yBuffer);
-
         ByteBuffer uBuffer = uPlane.getBuffer();
         uBuffer.rewind();
-        frameBuffer.put(uBuffer);
+        ByteBuffer vBuffer = vPlane.getBuffer();
+        vBuffer.rewind();
 
-        frameBuffer.flip();
+        boolean sent = omtSender.sendFramePlanes(
+                frameBuffer,
+                yBuffer, yBuffer.limit(), yRowStride, yPlane.getPixelStride(),
+                uBuffer, uBuffer.limit(), uPlane.getRowStride(), uPlane.getPixelStride(),
+                vBuffer, vBuffer.limit(), vPlane.getRowStride(), vPlane.getPixelStride(),
+                width, height);
 
-        // Send to OMT
-        omtSender.sendFrame(frameBuffer, image.getWidth(), image.getHeight(), yStride, uvStride);
+        if (!sent) {
+            // The native side logs why; this is the tally that keeps a device-wide refusal from
+            // looking like a healthy stream that is simply idle.
+            sendFailureCount++;
+            if (sendFailureCount <= 3 || (DEBUG_LOGS && sendFailureCount % 30 == 0)) {
+                Log.w(TAG, "sendFrame: frame " + sentFrameCount + " did not reach any receiver "
+                        + "(" + sendFailureCount + " refused/unsent so far)");
+            }
+        }
     }
 
     private void startBackgroundThread() {

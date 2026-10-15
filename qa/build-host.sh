@@ -478,6 +478,123 @@ then build_and_run_codec as-mutant-free-always "$ROOT/qa/aligned-stride.cpp" "$M
 fi
 
 echo
+# ---------------------------------------------------------------------------
+# planar-chroma: the capture path must honour BOTH chroma layouts of YUV_420_888.
+#
+# qa/planar-chroma.cpp compiles app/src/main/cpp/omtnv12.h — the SAME header the APK builds — against
+# synthetic plane geometries, so the layout decision that decides whether a phone can stream at all
+# is testable without a phone. Two things make the section worth running:
+#   * pc-prefix builds the identical scenarios against a verbatim transcription of the pre-fix
+#     capture path (the Java plane copy + OMTBridge.cpp:121's dataLength arithmetic). Case B is the
+#     emulator's own geometry — 1920x1080, y rowStride 1920, chroma rowStride 960, chroma
+#     pixelStride 1 — and it MUST be red there. That is the bug, measured, not described.
+#   * the mutants sabotage one property of the packer each. In particular mp3 (the chroma row walked
+#     with the luma stride) dies to ASan, because the fake planes are allocated to exactly
+#     Image.Plane.getBuffer().limit() and nothing more.
+# Android host QA is ASan-only here (no libubsan for this target), as everywhere in this file.
+# ---------------------------------------------------------------------------
+# build_planar <name> <expect pass|fail> [extra compiler flags...]
+# Extra -I dirs go FIRST: a mutant's copy of omtnv12.h has to win the include race against the
+# tree's, and the first -I on the command line does.
+build_planar() {
+  local name=$1 expect=$2; shift 2
+  local extra="$*"
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS $extra $INC -I"$ROOT/app/src/main/cpp" "$ROOT/qa/planar-chroma.cpp" \
+       "$ROOT/libomt/cpp/OMTChannel.cpp" "$ROOT/libomt/cpp/OMTAsyncPool.cpp" \
+       "$ROOT/libomt/cpp/OMTSender.cpp" "$ROOT/libomt/cpp/OMTDiscovery.cpp" \
+       "$ROOT/libvmx/src/vmxcodec.cpp" "$ROOT/libvmx/src/vmxcodec_x86.cpp" \
+       "$ROOT/libvmx/src/vmxcodec_avx2.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -15
+    rc=1; return
+  fi
+  score_run "$name" "$expect"
+}
+
+fresh_copy_bridge() { # <dir> — an isolated copy of the JNI bridge's headers, for packer mutants
+  local d="$SCRATCH/$1"; rm -rf "$d"; mkdir -p "$d"
+  cp "$ROOT"/app/src/main/cpp/*.h "$d"/
+  echo "$d"
+}
+
+mutate_bridge() { # <dir> <old> <new> <what> — one property sabotaged, or the suite is not honest
+  local d=$1
+  python3 - "$d/omtnv12.h" "$2" "$3" "$4" <<'PY'
+import sys
+p, old, new, what = sys.argv[1:5]
+s = open(p).read()
+assert s.count(old) == 1, "cannot find the clause to mutate (%s): %r" % (what, old[:70])
+open(p, "w").write(s.replace(old, new, 1))
+PY
+  if [ $? -ne 0 ]; then echo "  $4: MUTATION FAILED (the clause is gone — the suite would pass by forgetting)"; rc=1; fi
+}
+
+echo "== planar-chroma: YUV_420_888 is two layouts, and the sender must serve both =="
+build_planar pc-fixed pass
+
+# The pre-fix build: same scenarios, same assertions, the capture path as it stood before this
+# branch. Red on case B (the emulator's planar I420) is the point of the whole exercise.
+build_planar pc-prefix fail -DOMT_QA_PLANAR_PREFIX
+
+# MP1: pixelStride ignored — the packer decides "interleaved" without asking the HAL. The planar
+# frames then fail the NV12 row-width check and never reach the encoder at all.
+MP1=$(fresh_copy_bridge mutant-pixelstride)
+mutate_bridge "$MP1" \
+  '    const bool planar = (u.pixelStride == 1 && v.pixelStride == 1);
+    const bool interleaved = (u.pixelStride == 2 && v.pixelStride == 2);' \
+  '    const bool planar = false;   // MUTANT: the HAL was asked nothing
+    const bool interleaved = true;' \
+  "ignore pixelStride"
+build_planar pc-mutant-pixelstride fail -I"$MP1"
+
+# MP2: the interleave forgotten — a planar Cb plane wearing Cr's clothes. Content, not size: only a
+# byte-by-byte assertion sees it, which is why the harness compares against the source planes.
+MP2=$(fresh_copy_bridge mutant-no-interleave)
+mutate_bridge "$MP2" \
+  '                row[2 * c]     = srcU[c];
+                row[2 * c + 1] = srcV[c];' \
+  '                row[2 * c]     = srcU[c];
+                row[2 * c + 1] = srcU[c];  // MUTANT: the Cr plane is never read' \
+  "forget to interleave"
+build_planar pc-mutant-no-interleave fail -I"$MP2"
+
+# MP3: THE ORIGINAL DEFECT, one line wide — the chroma row walked with the luma stride. The size
+# pre-checks still pass (they use the plane's own rowStride), so this dies to ASan reading past the
+# end of a Cb plane allocated to exactly its reported limit. That report is the proof.
+MP3=$(fresh_copy_bridge mutant-chroma-luma-stride)
+mutate_bridge "$MP3" \
+  '            const uint8_t* srcU = u.data + r * static_cast<int64_t>(u.rowStride);
+            const uint8_t* srcV = v.data + r * static_cast<int64_t>(v.rowStride);' \
+  '            const uint8_t* srcU = u.data + r * stride;   // MUTANT: the luma stride, as pre-fix
+            const uint8_t* srcV = v.data + r * stride;' \
+  "chroma walked with the luma stride"
+build_planar pc-mutant-chroma-luma-stride fail -I"$MP3"
+
+# MP4: the frame charged with the SOURCE uv rowStride instead of the stride the encoder will use —
+# OMTBridge.cpp:121's arithmetic, smuggled back into the packer. The gate refuses it, which is the
+# whole reason the defect was diagnosable at all.
+MP4=$(fresh_copy_bridge mutant-old-arithmetic)
+mutate_bridge "$MP4" \
+  '    const int64_t dataLength = h * stride + chromaRows * stride;' \
+  '    const int64_t dataLength = h * stride + chromaRows * (planar ? (int64_t)u.rowStride : stride);  // MUTANT: pre-fix arithmetic' \
+  "charge with the source uvStride"
+build_planar pc-mutant-old-arithmetic fail -I"$MP4"
+
+# MP5: the UV plane parked at width*height instead of stride*height. Invisible on an unpadded frame,
+# fatal on a padded one — encodeFrame() computes uv = data + stride*height and would encode the tail
+# of the luma plane as chroma.
+MP5=$(fresh_copy_bridge mutant-uv-offset)
+mutate_bridge "$MP5" \
+  '    uint8_t* uv = dst + h * stride;  // where encodeFrame() will point VMX — do not move it' \
+  '    uint8_t* uv = dst + h * w;       // MUTANT: the tight NV12 offset, wrong for a padded stride' \
+  "UV plane at the wrong offset"
+build_planar pc-mutant-uv-offset fail -I"$MP5"
+
+echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
   echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"
   [ ${#FAILED[@]} -gt 0 ] && echo "  failing scenarios: ${FAILED[*]}"
