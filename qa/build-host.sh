@@ -493,7 +493,7 @@ build_and_run_channel() { # <name> <test.cpp> <omt-src-dir> <expect pass|fail>
   if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
     echo "  $name: BUILD FAILED (refusing to score an absent run)"
     sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
-    rc=1; return
+    FAILED+=("$name(build-failed)"); rc=1; return
   fi
   score_run "$name" "$expect"
 }
@@ -505,32 +505,37 @@ build_and_run_channel sw-fixed "$ROOT/qa/socket-write-order.cpp" "$ROOT/libomt/c
 # that already has sendWithDeadline (45b8b48e) and nothing else. OMTConstants.h is deliberately
 # left alone: the scenario asserts against the new budgets by name, and reverting the header that
 # merely declares them would fail the BUILD rather than the gate.
-BASE_SW=${QA_BASE:-fix/omt-input-validation-off-the-desktop}
+# Pinned to d2ab8ca8 — the commit this branch sat on (old tip of
+# fix/omt-input-validation-off-the-desktop, an ancestor of master so always reachable): the
+# tree that already has sendWithDeadline (45b8b48e) and nothing else. A branch NAME is
+# deletable and absent from fresh clones; QA_BASE overrides must name a commit, not a moving ref.
+BASE_SW=${QA_BASE:-d2ab8ca8}
 PFS="$SCRATCH/pre-fix-write"; rm -rf "$PFS"; mkdir -p "$PFS"
 cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$PFS"/
 for f in OMTChannel.cpp OMTChannel.h; do
-  git show "$BASE_SW:libomt/cpp/$f" > "$PFS/$f" 2>/dev/null || { echo "  cannot extract $f from $BASE_SW"; rc=1; }
+  extract_rev_file "$BASE_SW" "libomt/cpp/$f" "$PFS/$f"
 done
-grep -q 'sendSocketMutex_' "$PFS/OMTChannel.cpp" \
-  && { echo "  the pre-fix copy still has the write lock — extraction failed"; rc=1; }
+must_not_grep "$PFS/OMTChannel.cpp" 'sendSocketMutex_'
+must_grep     "$PFS/OMTChannel.cpp" 'sendWithDeadline'
 build_and_run_channel sw-prefix "$ROOT/qa/socket-write-order.cpp" "$PFS" fail
 
 # MS1: the video writer stops taking the write lock. The metadata writer still tries, but a lock
 # nobody else holds is not serialisation — this is the mis-framing defect in one line.
 MS1=$(fresh_copy mutant-video-unlocked)
-python3 - "$MS1/OMTChannel.cpp" <<'PY'
+if apply_mutant sw-mutant-video-unlocked "$MS1/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "    std::lock_guard<std::mutex> writeLock(sendSocketMutex_);\n    const int fd = socketFd_;"
 assert s.count(old) == 1, "sendAllBlocking write lock not found"
 open(p, "w").write(s.replace(old, "    // MUTANT: the async video writer writes without the lock\n    const int fd = socketFd_;", 1))
 PY
-build_and_run_channel sw-mutant-video-unlocked "$ROOT/qa/socket-write-order.cpp" "$MS1" fail
+then build_and_run_channel sw-mutant-video-unlocked "$ROOT/qa/socket-write-order.cpp" "$MS1" fail
+fi
 
 # MS2: the metadata writer stops taking the lock (and stops bounding its acquisition). Same defect,
 # other direction: a handshake or a tally broadcast during streaming is enough to tear the stream.
 MS2=$(fresh_copy mutant-metadata-unlocked)
-python3 - "$MS2/OMTChannel.cpp" <<'PY'
+if apply_mutant sw-mutant-metadata-unlocked "$MS2/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "    while (!sendSocketMutex_.try_lock()) {"
@@ -541,19 +546,21 @@ open(p, "w").write(s[:i] + "    // MUTANT: metadata is written with no lock and 
                    .replace("std::lock_guard<std::mutex> writeLock(sendSocketMutex_, std::adopt_lock);",
                             "// MUTANT: nothing was acquired to adopt", 1))
 PY
-build_and_run_channel sw-mutant-metadata-unlocked "$ROOT/qa/socket-write-order.cpp" "$MS2" fail
+then build_and_run_channel sw-mutant-metadata-unlocked "$ROOT/qa/socket-write-order.cpp" "$MS2" fail
+fi
 
 # MS3: the deadline is back to being per-poll rather than per-write. The trickle peer keeps poll()
 # succeeding forever, so S2 — the eviction — is what dies.
 MS3=$(fresh_copy mutant-per-poll-deadline)
-python3 - "$MS3/OMTChannel.cpp" <<'PY'
+if apply_mutant sw-mutant-per-poll-deadline "$MS3/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "        if (now >= deadline) {"
 assert s.count(old) == 1, "whole-write deadline not found"
 open(p, "w").write(s.replace(old, "        if (false && now >= deadline) {  // MUTANT: only poll() is bounded", 1))
 PY
-build_and_run_channel sw-mutant-per-poll-deadline "$ROOT/qa/socket-write-order.cpp" "$MS3" fail
+then build_and_run_channel sw-mutant-per-poll-deadline "$ROOT/qa/socket-write-order.cpp" "$MS3" fail
+fi
 
 # MS4: the write loop stops looking at running_/connected_. S2 stays green — the overall deadline is
 # still there — and S3 is what dies: the frame keeps being served to a peer that is no longer going
@@ -561,14 +568,15 @@ build_and_run_channel sw-mutant-per-poll-deadline "$ROOT/qa/socket-write-order.c
 # check is load-bearing and is NOT covered by ~Channel()'s shutdown(SHUT_RDWR), which is why S3 marks
 # the channel dead with the peer's FIN instead of by tearing the channel down.
 MS4=$(fresh_copy mutant-no-alive-check)
-python3 - "$MS4/OMTChannel.cpp" <<'PY'
+if apply_mutant sw-mutant-no-alive-check "$MS4/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "        if (!running_ || !connected_) {"
 assert s.count(old) == 1, "alive check not found"
 open(p, "w").write(s.replace(old, "        if (false) {  // MUTANT: teardown cannot interrupt the write", 1))
 PY
-build_and_run_channel sw-mutant-no-alive-check "$ROOT/qa/socket-write-order.cpp" "$MS4" fail
+then build_and_run_channel sw-mutant-no-alive-check "$ROOT/qa/socket-write-order.cpp" "$MS4" fail
+fi
 
 echo
 
