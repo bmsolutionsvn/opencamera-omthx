@@ -14,9 +14,15 @@ android {
         //testInstrumentationRunner "android.test.InstrumentationTestRunner"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         
-        // OMT: Only build for arm64-v8a (our native libs are pre-built for this ABI)
+        // OMT: two ABIs, both built from source by app/src/main/cpp/CMakeLists.txt.
+        // arm64-v8a binds the NEON codec (vmxcodec_arm.cpp + -DARM64); x86_64 binds the SSE/AVX2
+        // codec (vmxcodec_x86.cpp + vmxcodec_avx2.cpp). Before 2026-10-15 this was arm64-only, which
+        // forced the x86_64 emulator to run the ARM lib under libndk_translation and hid every
+        // native-code problem behind that penalty.
+        // NOTE: there are no prebuilt .so files in this repo (removed in 367b2be7) — an ABI listed
+        // here that CMakeLists.txt does not know how to bind fails the configure step, by design.
         ndk {
-            abiFilters 'arm64-v8a'
+            abiFilters 'arm64-v8a', 'x86_64'
         }
     }
 
