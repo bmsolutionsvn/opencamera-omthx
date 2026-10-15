@@ -158,7 +158,11 @@ private:
     std::atomic<bool> running_{false};
     
     // Channels
-    std::vector<std::unique_ptr<Channel>> channels_;
+    // shared_ptr, not unique_ptr: a fan-out that releases the lock before touching a socket
+    // must be able to hold a reference while it does so. With unique_ptr the only safe pattern
+    // was to keep channelsMutex_ held across blocking socket writes, which let one stalled
+    // subscriber stop the camera thread.
+    std::vector<std::shared_ptr<Channel>> channels_;
     mutable std::mutex channelsMutex_;
     
     // VMX Encoder
@@ -181,7 +185,7 @@ private:
     void acceptLoop();
     
     // Add/remove channels
-    void addChannel(std::unique_ptr<Channel> channel);
+    void addChannel(std::shared_ptr<Channel> channel);
     void removeChannel(Channel* channel);
     void cleanupDisconnected();
     

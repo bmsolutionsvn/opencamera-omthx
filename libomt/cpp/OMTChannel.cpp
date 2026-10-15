@@ -5,6 +5,7 @@
 
 #include "OMTChannel.h"
 #include <cstring>
+#include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
@@ -42,10 +43,21 @@ Channel::Channel(int socketFd, struct sockaddr_in address,
     // TCP keepalive
     setsockopt(socketFd_, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
     
-    // TCP_KEEPIDLE = 5 seconds (matches official libomtnet)
+    // TCP_KEEPIDLE = 5 seconds (matches official libomtnet) — but idle alone is not a timeout.
+    // With KEEPINTVL/KEEPCNT left at their kernel defaults (75s between probes, 9 probes) a peer
+    // that vanished without sending RST takes ~11 minutes to be declared dead, and every frame in
+    // the meantime is written into a black hole. Probing hard makes that ~11s.
 #ifdef TCP_KEEPIDLE
-    int keepIdle = 5;
+    int keepIdle = Constants::NETWORK_KEEPALIVE_IDLE_S;
     setsockopt(socketFd_, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(keepIdle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int keepIntvl = Constants::NETWORK_KEEPALIVE_INTVL_S;
+    setsockopt(socketFd_, IPPROTO_TCP, TCP_KEEPINTVL, &keepIntvl, sizeof(keepIntvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int keepCnt = Constants::NETWORK_KEEPALIVE_CNT;
+    setsockopt(socketFd_, IPPROTO_TCP, TCP_KEEPCNT, &keepCnt, sizeof(keepCnt));
 #endif
     
     // Create async send pool
@@ -151,22 +163,22 @@ bool Channel::sendMetadataSync(const char* xml) {
     header.metadataLength = static_cast<uint16_t>(totalLen);
     header.dataLength = totalLen;
     
-    // Temporarily make blocking
-    int flags = fcntl(socketFd_, F_GETFL, 0);
-    fcntl(socketFd_, F_SETFL, flags & ~O_NONBLOCK);
-    
-    ssize_t s1 = send(socketFd_, &header, sizeof(header), MSG_NOSIGNAL);
-    
-    std::vector<char> buf(totalLen);
-    memcpy(buf.data(), xml, len);
-    buf[len] = 0;
-    
-    ssize_t s2 = send(socketFd_, buf.data(), totalLen, MSG_NOSIGNAL);
-    
-    // Restore non-blocking
-    fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-    
-    return (s1 > 0 && s2 == totalLen);
+    // Was: clear O_NONBLOCK, fire two bare send()s, restore the flags. A wedged subscriber made
+    // this block indefinitely, and its only caller (Sender::sendMetadata) held channelsMutex_ —
+    // the same mutex the camera thread takes to fan out frames — so ONE stalled viewer stopped
+    // the whole stream, not just that viewer's. One buffer, one deadline, no flag changes.
+    std::vector<char> buf(sizeof(FrameHeader) + (size_t)totalLen);
+    memcpy(buf.data(), &header, sizeof(FrameHeader));
+    memcpy(buf.data() + sizeof(FrameHeader), xml, len);
+    buf[sizeof(FrameHeader) + len] = 0;
+
+    bool ok = sendWithDeadline(reinterpret_cast<const uint8_t*>(buf.data()), buf.size(),
+                               Constants::NETWORK_SEND_TIMEOUT_MS);
+    if (!ok) {
+        LOGE("sendMetadataSync: timed out or failed, dropping this subscriber");
+        connected_ = false;
+    }
+    return ok;
 }
 
 int Channel::sendAsync(const void* headerData, size_t headerLen,
@@ -246,37 +258,46 @@ void Channel::senderLoop() {
     LOGI("senderLoop: exiting");
 }
 
-bool Channel::sendAllBlocking(const uint8_t* data, size_t length) {
-    // Make blocking for this call
-    int flags = fcntl(socketFd_, F_GETFL, 0);
-    fcntl(socketFd_, F_SETFL, flags & ~O_NONBLOCK);
-    
+// Write the whole buffer, but never longer than the deadline. The socket stays non-blocking the
+// whole time (as Channel's constructor set it up) and poll() decides when a send is worth trying,
+// which is why there is no fcntl() flag toggling here any more: toggling a shared fd to blocking
+// mode meant any other thread that sent on it during that window — or any early return that
+// missed the restore — inherited a socket whose behaviour had silently changed.
+bool Channel::sendWithDeadline(const uint8_t* data, size_t length, int timeoutMs) {
     size_t remaining = length;
     const uint8_t* ptr = data;
-    
-    while (remaining > 0 && connected_) {
-        ssize_t sent = send(socketFd_, ptr, remaining, MSG_NOSIGNAL);
-        
-        if (sent > 0) {
-            ptr += sent;
-            remaining -= sent;
-        } else if (sent < 0) {
-            if (errno == EINTR) continue;
-            
-            LOGE("sendAllBlocking: error %d (%s)", errno, strerror(errno));
-            connected_ = false;
-            
-            fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-            return false;
-        } else {
-            connected_ = false;
-            fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
+    while (remaining > 0) {
+        struct pollfd pfd;
+        pfd.fd = socketFd_;
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, timeoutMs);
+        if (pr == 0) {
+            LOGE("sendWithDeadline: peer did not drain the TCP window in %d ms, evicting",
+                 timeoutMs);
             return false;
         }
+        if (pr < 0) {
+            if (errno == EINTR) continue;
+            LOGE("sendWithDeadline: poll error %d (%s)", errno, strerror(errno));
+            return false;
+        }
+        if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
+
+        ssize_t sent = send(socketFd_, ptr, remaining, MSG_NOSIGNAL);
+        if (sent > 0) { ptr += (size_t)sent; remaining -= (size_t)sent; continue; }
+        if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        LOGE("sendWithDeadline: send error %d (%s)", errno, strerror(errno));
+        return false;
     }
-    
-    fcntl(socketFd_, F_SETFL, flags | O_NONBLOCK);
-    return remaining == 0;
+    return true;
+}
+
+bool Channel::sendAllBlocking(const uint8_t* data, size_t length) {
+    // Name kept for the call sites; it no longer blocks without bound.
+    bool ok = sendWithDeadline(data, length, Constants::NETWORK_SEND_TIMEOUT_MS);
+    if (!ok) connected_ = false;
+    return ok;
 }
 
 void Channel::receiverLoop() {

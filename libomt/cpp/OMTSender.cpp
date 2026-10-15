@@ -129,7 +129,7 @@ void Sender::acceptLoop() {
             }
         }
         
-        auto channel = std::make_unique<Channel>(clientFd, clientAddr, bufferSize, this);
+        auto channel = std::make_shared<Channel>(clientFd, clientAddr, bufferSize, this);
         
         // Send configured sender info immediately
         channel->sendMetadataSync(config_.senderInfoXml.c_str());
@@ -144,29 +144,33 @@ void Sender::acceptLoop() {
     LOGI("acceptLoop: exiting");
 }
 
-void Sender::addChannel(std::unique_ptr<Channel> channel) {
+void Sender::addChannel(std::shared_ptr<Channel> channel) {
     std::lock_guard<std::mutex> lock(channelsMutex_);
     channels_.push_back(std::move(channel));
 }
 
 void Sender::removeChannel(Channel* channel) {
-    std::lock_guard<std::mutex> lock(channelsMutex_);
-    channels_.erase(
-        std::remove_if(channels_.begin(), channels_.end(),
-            [channel](const std::unique_ptr<Channel>& c) {
-                return c.get() == channel;
-            }),
-        channels_.end());
+    // Unlink under the lock; ~Channel joins two threads, and the camera thread takes this same
+    // mutex for every frame it fans out.
+    std::vector<std::shared_ptr<Channel>> doomed;
+    {
+        std::lock_guard<std::mutex> lock(channelsMutex_);
+        for (auto it = channels_.begin(); it != channels_.end(); ++it) {
+            if (it->get() == channel) { doomed.push_back(std::move(*it)); channels_.erase(it); break; }
+        }
+    }
 }
 
 void Sender::cleanupDisconnected() {
-    std::lock_guard<std::mutex> lock(channelsMutex_);
-    channels_.erase(
-        std::remove_if(channels_.begin(), channels_.end(),
-            [](const std::unique_ptr<Channel>& c) {
-                return !c->isConnected();
-            }),
-        channels_.end());
+    // Same rule as removeChannel: unlink fast, join outside the critical section.
+    std::vector<std::shared_ptr<Channel>> doomed;
+    {
+        std::lock_guard<std::mutex> lock(channelsMutex_);
+        for (auto it = channels_.begin(); it != channels_.end(); ) {
+            if (!it->get()->isConnected()) { doomed.push_back(std::move(*it)); it = channels_.erase(it); }
+            else ++it;
+        }
+    }
 }
 
 int Sender::connectionCount() const {
@@ -378,12 +382,18 @@ int Sender::send(const MediaFrame& frame) {
 }
 
 void Sender::sendMetadata(const std::string& xml) {
-    std::lock_guard<std::mutex> lock(channelsMutex_);
-    for (const auto& ch : channels_) {
-        if (ch->isConnected()) {
-            ch->sendMetadataSync(xml.c_str());
-        }
+    // Snapshot the list, release the lock, THEN write to sockets. sendMetadataSync used to block
+    // without a deadline while channelsMutex_ was held - the same mutex the camera thread needs
+    // in send() - so one stalled viewer froze the whole stream instead of just itself. The
+    // shared_ptr keeps each channel alive while we write to it even if another thread prunes the
+    // list meanwhile.
+    std::vector<std::shared_ptr<Channel>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(channelsMutex_);
+        snapshot.reserve(channels_.size());
+        for (const auto& ch : channels_) if (ch->isConnected()) snapshot.push_back(ch);
     }
+    for (const auto& ch : snapshot) ch->sendMetadataSync(xml.c_str());
 }
 
 Quality Sender::getBestSuggestedQuality() const {

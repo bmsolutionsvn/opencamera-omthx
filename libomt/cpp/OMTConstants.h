@@ -16,6 +16,16 @@ namespace omt {
 namespace Constants {
     constexpr int NETWORK_SEND_BUFFER = 65536;
     constexpr int NETWORK_RECEIVE_BUFFER = 8388608;  // 8MB
+    // How long one frame may wait for a subscriber's TCP window before it is dropped and the
+    // channel evicted. A live stream has no second chances: a frame that cannot leave in this
+    // budget is already too late to display. Without a bound the sender thread sits in send()
+    // until the kernel gives up on the peer (~11 min with only TCP_KEEPIDLE set), holding every
+    // AsyncPool slot it owns so that subscriber's stream is dead meanwhile.
+    constexpr int NETWORK_SEND_TIMEOUT_MS = 1000;
+    constexpr int NETWORK_KEEPALIVE_IDLE_S = 5;    // first probe (matches libomtnet)
+    constexpr int NETWORK_KEEPALIVE_INTVL_S = 2;   // repeat probes: unset kernel default is 75s
+    constexpr int NETWORK_KEEPALIVE_CNT = 3;       // failed probes before the peer is declared gone
+
     constexpr int NETWORK_ASYNC_COUNT = 4;           // Official: 4 (matches libomtnet)
     constexpr int NETWORK_ASYNC_BUFFER_AV = 1048576; // Official: 1MB (matches libomtnet)
     constexpr int NETWORK_ASYNC_COUNT_META_ONLY = 64;
