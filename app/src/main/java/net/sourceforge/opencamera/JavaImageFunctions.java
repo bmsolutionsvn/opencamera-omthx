@@ -2971,6 +2971,11 @@ public class JavaImageFunctions {
         private final Bitmap bitmap_in;
         private final int width, height;
         private JavaImageProcessing.FastAccessBitmap [] fast_bitmap_in;
+        // per-thread scratch buffers for the derivative output, reused across chunks; indexed by
+        // thread_index exactly like fast_bitmap_in, so each buffer has a single owning thread and
+        // needs no synchronisation (see JavaImageProcessing.ApplyFunctionThread).
+        private int [][] cache_bitmap_Ix;
+        private int [][] cache_bitmap_Iy;
 
         ComputeDerivativesFunction(Bitmap bitmap_Ix, Bitmap bitmap_Iy, Bitmap bitmap_in) {
             this.bitmap_Ix = bitmap_Ix;
@@ -2983,71 +2988,100 @@ public class JavaImageFunctions {
         @Override
         public void init(int n_threads) {
             fast_bitmap_in = new JavaImageProcessing.FastAccessBitmap[n_threads];
+            cache_bitmap_Ix = new int[n_threads][];
+            cache_bitmap_Iy = new int[n_threads][];
 
             for(int i=0;i<n_threads;i++) {
                 fast_bitmap_in[i] = new JavaImageProcessing.FastAccessBitmap(bitmap_in);
             }
         }
 
+        /** Returns the calling thread's scratch buffer of at least required_size elements,
+         *  reallocating (and thus discarding any stale contents) only when the existing buffer
+         *  is too small. package-private static so unit tests can drive the reuse policy directly.
+         */
+        static int [] getThreadCache(int [][] caches, int thread_index, int required_size) {
+            int [] cache = caches[thread_index];
+            if( cache == null || cache.length < required_size ) {
+                cache = new int[required_size];
+                caches[thread_index] = cache;
+            }
+            return cache;
+        }
+
+        /** Computes the Sobel derivatives for one row of the chunk, writing this_width entries
+         *  to cache_Ix/cache_Iy starting at c_start. Reads the three source rows from
+         *  bitmap_in_cache_pixels, whose first row corresponds to bitmap_in_cache_y.
+         *  package-private static so unit tests can compare it bit-for-bit against the original
+         *  inline implementation.
+         */
+        static void computeDerivativesRow(int [] bitmap_in_cache_pixels, int bitmap_in_cache_y, int y,
+                int off_x, int this_width, int width, int height,
+                int [] cache_Ix, int [] cache_Iy, int c_start) {
+            int y_rel_bitmap_in_cache = y-bitmap_in_cache_y;
+            for(int x=off_x,c=c_start;x<off_x+this_width;x++,c++) {
+
+                int Ix = 0, Iy = 0;
+                if( x >= 1 && x < width-1 && y >= 1 && y < height-1 ) {
+                    // use Sobel operator
+
+                    //int pixel0 = fast_bitmap_in[thread_index].getPixel(x-1, y-1) >>> 24;
+                    int pixel1 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache-1)*width+(x)] >>> 24;
+                    //int pixel2 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache-1)*width+(x+1)] >>> 24;
+                    int pixel3 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache)*width+(x-1)] >>> 24;
+                    int pixel5 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache)*width+(x+1)] >>> 24;
+                    //int pixel6 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache+1)*width+(x-1)] >>> 24;
+                    int pixel7 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache+1)*width+(x)] >>> 24;
+                    //int pixel8 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache+1)*width+(x+1)] >>> 24;
+
+                    //int iIx = (pixel2 + 2*pixel5 + pixel8) - (pixel0 + 2*pixel3 + pixel6);
+                    //int iIy = (pixel6 + 2*pixel7 + pixel8) - (pixel0 + 2*pixel1 + pixel2);
+                    //iIx /= 8;
+                    //iIy /= 8;
+                    int iIx = (pixel5 - pixel3)/2;
+                    int iIy = (pixel7 - pixel1)/2;
+
+                    // convert so we can store in range 0-255
+
+                    iIx = Math.max(iIx, -127);
+                    iIx = Math.min(iIx, 128);
+                    iIx += 127; // iIx now runs from 0 to 255
+
+                    iIy = Math.max(iIy, -127);
+                    iIy = Math.min(iIy, 128);
+                    iIy += 127; // iIy now runs from 0 to 255
+
+                    Ix = iIx;
+                    Iy = iIy;
+                }
+
+                //bitmap_Ix.setPixel(x, y, Ix << 24);
+                //bitmap_Iy.setPixel(x, y, Iy << 24);
+                cache_Ix[c] = Ix << 24;
+                cache_Iy[c] = Iy << 24;
+            }
+        }
+
         @Override
         public void apply(JavaImageProcessing.CachedBitmap output, int thread_index, int off_x, int off_y, int this_width, int this_height) {
-            // we could move these to class members for performance, remember we'd have to have a version per-thread
-            int [] cache_bitmap_Ix = new int[this_width*this_height];
-            int [] cache_bitmap_Iy = new int[this_width*this_height];
+            // Reuse the per-thread scratch buffers instead of allocating two this_width*this_height
+            // arrays per chunk; every element of [0, this_width*this_height) is written by
+            // computeDerivativesRow before setPixels reads it, so reused contents cannot leak.
+            int required_size = this_width*this_height;
+            int [] cache_Ix = getThreadCache(cache_bitmap_Ix, thread_index, required_size);
+            int [] cache_Iy = getThreadCache(cache_bitmap_Iy, thread_index, required_size);
 
-            for(int y=off_y,c=0;y<off_y+this_height;y++) {
+            for(int y=off_y,c=0;y<off_y+this_height;y++,c+=this_width) {
 
                 fast_bitmap_in[thread_index].ensureCache(y-1, y+1); // force cache to cover rows needed by this row
                 int bitmap_in_cache_y = fast_bitmap_in[thread_index].getCacheY();
-                int y_rel_bitmap_in_cache = y-bitmap_in_cache_y;
                 int [] bitmap_in_cache_pixels = fast_bitmap_in[thread_index].getCachedPixelsI();
 
-                for(int x=off_x;x<off_x+this_width;x++,c++) {
-
-                    int Ix = 0, Iy = 0;
-                    if( x >= 1 && x < width-1 && y >= 1 && y < height-1 ) {
-                        // use Sobel operator
-
-                        //int pixel0 = fast_bitmap_in[thread_index].getPixel(x-1, y-1) >>> 24;
-                        //int pixel0 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache-1)*width+(x-1)] >>> 24;
-                        int pixel1 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache-1)*width+(x)] >>> 24;
-                        //int pixel2 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache-1)*width+(x+1)] >>> 24;
-                        int pixel3 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache)*width+(x-1)] >>> 24;
-                        int pixel5 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache)*width+(x+1)] >>> 24;
-                        //int pixel6 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache+1)*width+(x-1)] >>> 24;
-                        int pixel7 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache+1)*width+(x)] >>> 24;
-                        //int pixel8 = bitmap_in_cache_pixels[(y_rel_bitmap_in_cache+1)*width+(x+1)] >>> 24;
-
-                        //int iIx = (pixel2 + 2*pixel5 + pixel8) - (pixel0 + 2*pixel3 + pixel6);
-                        //int iIy = (pixel6 + 2*pixel7 + pixel8) - (pixel0 + 2*pixel1 + pixel2);
-                        //iIx /= 8;
-                        //iIy /= 8;
-                        int iIx = (pixel5 - pixel3)/2;
-                        int iIy = (pixel7 - pixel1)/2;
-
-                        // convert so we can store in range 0-255
-
-                        iIx = Math.max(iIx, -127);
-                        iIx = Math.min(iIx, 128);
-                        iIx += 127; // iIx now runs from 0 to 255
-
-                        iIy = Math.max(iIy, -127);
-                        iIy = Math.min(iIy, 128);
-                        iIy += 127; // iIy now runs from 0 to 255
-
-                        Ix = iIx;
-                        Iy = iIy;
-                    }
-
-                    //bitmap_Ix.setPixel(x, y, Ix << 24);
-                    //bitmap_Iy.setPixel(x, y, Iy << 24);
-                    cache_bitmap_Ix[c] = Ix << 24;
-                    cache_bitmap_Iy[c] = Iy << 24;
-                }
+                computeDerivativesRow(bitmap_in_cache_pixels, bitmap_in_cache_y, y, off_x, this_width, width, height, cache_Ix, cache_Iy, c);
             }
 
-            bitmap_Ix.setPixels(cache_bitmap_Ix, 0, this_width, off_x, off_y, this_width, this_height);
-            bitmap_Iy.setPixels(cache_bitmap_Iy, 0, this_width, off_x, off_y, this_width, this_height);
+            bitmap_Ix.setPixels(cache_Ix, 0, this_width, off_x, off_y, this_width, this_height);
+            bitmap_Iy.setPixels(cache_Iy, 0, this_width, off_x, off_y, this_width, this_height);
         }
 
         @Override
