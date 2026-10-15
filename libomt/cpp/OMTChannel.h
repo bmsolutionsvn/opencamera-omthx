@@ -123,6 +123,23 @@ private:
     std::condition_variable queueCV_;
     std::thread senderThread_;
     std::thread receiverThread_;
+
+    /// Serialises EVERY write to socketFd_ — the video frames drained by senderLoop and the
+    /// synchronous metadata of sendMetadataSync — for the whole of each write, not just per send()
+    /// call. Without it a metadata broadcast (JNI/UI thread, or the accept loop at handshake) can
+    /// interleave its bytes with a half-written video record on the single TCP stream, and the
+    /// subscriber's stream is mis-framed permanently: every record after the tear is parsed off a
+    /// shifted offset, which OBS reports as a stream that dies and never recovers while the socket
+    /// itself stays up.
+    ///
+    /// Plain std::mutex, not std::timed_mutex: the metadata writer bounds acquisition with a
+    /// try_lock() loop, and std::mutex::try_lock is the path ThreadSanitizer models correctly
+    /// (std::timed_mutex's timed path produces spurious "unlock of an unlocked mutex" reports).
+    ///
+    /// Rule: sendWithDeadline() must only ever be called with this mutex held, so that the
+    /// connected_ = false that a failed write sets cannot be observed by a second writer in the
+    /// gap between the torn frame and the channel being marked dead.
+    std::mutex sendSocketMutex_;
     
     // Subscriptions and state
     std::atomic<Subscription> subscriptions_{Subscription::None};
@@ -157,8 +174,11 @@ private:
     // Socket helpers
     void setSendBuffer(int size);
     void closeSocket();
-    /// Writes the whole buffer or gives up after timeoutMs; never leaves the fd blocking.
-    bool sendWithDeadline(const uint8_t* data, size_t length, int timeoutMs);
+    /// Writes the whole buffer or gives up after timeoutMs — timeoutMs bounds the ENTIRE write,
+    /// not one poll() — and stops as soon as the channel is no longer alive. The fd is passed in,
+    /// read once by a caller that already holds sendSocketMutex_, rather than re-read from the
+    /// member on every iteration. Callers MUST hold sendSocketMutex_.
+    bool sendWithDeadline(int fd, const uint8_t* data, size_t length, int timeoutMs);
 };
 
 } // namespace omt

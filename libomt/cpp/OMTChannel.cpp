@@ -4,6 +4,7 @@
  */
 
 #include "OMTChannel.h"
+#include <chrono>
 #include <cstring>
 #include <poll.h>
 #include <unistd.h>
@@ -172,10 +173,40 @@ bool Channel::sendMetadataSync(const char* xml) {
     memcpy(buf.data() + sizeof(FrameHeader), xml, len);
     buf[sizeof(FrameHeader) + len] = 0;
 
-    bool ok = sendWithDeadline(reinterpret_cast<const uint8_t*>(buf.data()), buf.size(),
+    // P0 #7 (ported from the desktop vendored copy): take the per-channel write lock for the WHOLE
+    // frame. senderLoop is writing video to the same fd, and a metadata frame whose bytes land in
+    // the middle of a half-written video record does not lose a frame — it shifts the subscriber's
+    // parse offset for the rest of the connection.
+    //
+    // Acquisition is bounded, because the holder of that lock may be a writer that is itself
+    // waiting on a stalled peer for up to NETWORK_SEND_TIMEOUT_MS. try_lock() polled against a
+    // budget (std::mutex, not std::timed_mutex — see the member's comment for why).
+    const auto budget = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(Constants::NETWORK_METADATA_LOCK_BUDGET_MS);
+    while (!sendSocketMutex_.try_lock()) {
+        if (!running_ || !connected_) return false;
+        if (std::chrono::steady_clock::now() >= budget) {
+            LOGE("sendMetadataSync: could not acquire the socket-write lock within %d ms, "
+                 "dropping this subscriber", Constants::NETWORK_METADATA_LOCK_BUDGET_MS);
+            // Marking the channel dead is the only safe response: the alternative is to keep the
+            // caller waiting behind a writer that has already used its whole budget.
+            connected_ = false;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    std::lock_guard<std::mutex> writeLock(sendSocketMutex_, std::adopt_lock);
+
+    const int fd = socketFd_;          // read once, under the write lock
+    if (fd < 0) { connected_ = false; return false; }
+
+    bool ok = sendWithDeadline(fd, reinterpret_cast<const uint8_t*>(buf.data()), buf.size(),
                                Constants::NETWORK_SEND_TIMEOUT_MS);
     if (!ok) {
-        LOGE("sendMetadataSync: timed out or failed, dropping this subscriber");
+        LOGE("sendMetadataSync: incomplete metadata write, dropping this subscriber");
+        // Still holding sendSocketMutex_: a PARTIAL write leaves half a metadata record on the
+        // stream, so the channel must be dead — and visibly dead — before any waiting video writer
+        // can acquire the lock and append a full record behind the tear.
         connected_ = false;
     }
     return ok;
@@ -288,20 +319,46 @@ void Channel::senderLoop() {
 // which is why there is no fcntl() flag toggling here any more: toggling a shared fd to blocking
 // mode meant any other thread that sent on it during that window — or any early return that
 // missed the restore — inherited a socket whose behaviour had silently changed.
-bool Channel::sendWithDeadline(const uint8_t* data, size_t length, int timeoutMs) {
+bool Channel::sendWithDeadline(int fd, const uint8_t* data, size_t length, int timeoutMs) {
+    // Callers hold sendSocketMutex_ (see OMTChannel.h): this function is the one and only way
+    // anything writes to the subscriber, and it is only ever entered under that lock.
     size_t remaining = length;
     const uint8_t* ptr = data;
+    // P0 #7: timeoutMs (Constants::NETWORK_SEND_TIMEOUT_MS, unchanged at 1000 ms so the eviction
+    // timing the slow-subscriber gate already pins does not move) bounds the ENTIRE write. Bounding
+    // only each poll() is what let a peer that
+    // drains a few bytes per second hold a 1.5 MB frame open indefinitely — poll keeps succeeding,
+    // the per-poll deadline never fires, and the sender thread never comes back for the next frame.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
     while (remaining > 0) {
-        struct pollfd pfd;
-        pfd.fd = socketFd_;
-        pfd.events = POLLOUT;
-        pfd.revents = 0;
-        int pr = poll(&pfd, 1, timeoutMs);
-        if (pr == 0) {
-            LOGE("sendWithDeadline: peer did not drain the TCP window in %d ms, evicting",
-                 timeoutMs);
+        // P0 #7: and the write stops when the channel stops being alive. ~Channel() and disconnect()
+        // clear these; without the check a bounded-but-still-running write could outlive the
+        // teardown that is supposed to interrupt it.
+        if (!running_ || !connected_) {
+            LOGE("sendWithDeadline: channel is gone, abandoning the write at %zu/%zu bytes",
+                 length - remaining, length);
             return false;
         }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            LOGE("sendWithDeadline: peer did not take the whole buffer in %d ms — evicting "
+                 "(%zu/%zu bytes written)", timeoutMs, length - remaining, length);
+            return false;
+        }
+        // A poll slice, not the deadline: the slice is how often the two checks above are re-run,
+        // the deadline is how long the whole write may take. Bounding only the slice is what left a
+        // trickle peer able to hold the frame open forever.
+        auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+        const int sliceMs = (int)(left < Constants::NETWORK_SEND_POLL_SLICE_MS
+                                      ? (left < 1 ? 1 : left)
+                                      : Constants::NETWORK_SEND_POLL_SLICE_MS);
+
+        struct pollfd pfd;
+        pfd.fd = fd;                       // the caller's snapshot, not the member re-read
+        pfd.events = POLLOUT;
+        pfd.revents = 0;
+        int pr = poll(&pfd, 1, sliceMs);
+        if (pr == 0) continue;            // slice expired — re-check alive + overall deadline
         if (pr < 0) {
             if (errno == EINTR) continue;
             LOGE("sendWithDeadline: poll error %d (%s)", errno, strerror(errno));
@@ -309,7 +366,7 @@ bool Channel::sendWithDeadline(const uint8_t* data, size_t length, int timeoutMs
         }
         if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return false;
 
-        ssize_t sent = send(socketFd_, ptr, remaining, MSG_NOSIGNAL);
+        ssize_t sent = send(fd, ptr, remaining, MSG_NOSIGNAL);
         if (sent > 0) { ptr += (size_t)sent; remaining -= (size_t)sent; continue; }
         if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
         LOGE("sendWithDeadline: send error %d (%s)", errno, strerror(errno));
@@ -320,7 +377,19 @@ bool Channel::sendWithDeadline(const uint8_t* data, size_t length, int timeoutMs
 
 bool Channel::sendAllBlocking(const uint8_t* data, size_t length) {
     // Name kept for the call sites; it no longer blocks without bound.
-    bool ok = sendWithDeadline(data, length, Constants::NETWORK_SEND_TIMEOUT_MS);
+    //
+    // P0 #7: the same per-channel write lock sendMetadataSync takes, held for the whole frame, so
+    // the async video writer and the sync metadata writer cannot interleave on one TCP stream. The
+    // fd is read inside the lock — closeSocket() clears it, and a write that began with a stale
+    // snapshot would be sending on a descriptor the kernel may already have handed to another
+    // socket.
+    std::lock_guard<std::mutex> writeLock(sendSocketMutex_);
+    const int fd = socketFd_;
+    if (fd < 0) return false;
+    bool ok = sendWithDeadline(fd, data, length, Constants::NETWORK_SEND_TIMEOUT_MS);
+    // Under the lock, deliberately: whoever is waiting to write next must never get a turn in the
+    // gap between a torn frame and the channel being marked dead, or it appends a clean record
+    // behind the tear and the subscriber is mis-framed for the rest of the connection.
     if (!ok) connected_ = false;
     return ok;
 }
