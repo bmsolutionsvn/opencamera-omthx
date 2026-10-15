@@ -476,8 +476,27 @@ VMX_API VMX_INSTANCE* VMX_Create(VMX_SIZE dimensions, VMX_PROFILE profile, VMX_C
 
 #define CHECKBUFF_SAVE(checkNumBytes) \
 { \
-	if ((b + checkNumBytes) > maxB) return 0; \
+	/* P0 #10 (from the desktop vendored copy): the old form was \
+	   `if ((b + checkNumBytes) > maxB) return 0;`. Two problems. It FORMS the out-of-range \
+	   pointer b+n before comparing it, which is undefined as soon as n points past the end of \
+	   the caller's buffer; and it is a check that a hostile or corrupted n wins outright — n \
+	   negative puts b+n BELOW maxB, the check passes, and the memcpy that follows is handed \
+	   (size_t)(negative) as a length. Compare the bytes that are left instead, and refuse an n \
+	   that cannot be a real write: the slice loops below pass `4 + len`, so anything under 4 \
+	   is either a negative length or a length that wrapped in 32 bits on the way here. \
+	   maxB >= b holds because VMX_SaveTo() rejects maxLen <= 0 before the first use. */ \
+	const long long _remaining = (long long)(maxB - b); \
+	const long long _need = (long long)(checkNumBytes); \
+	if (_need < 4 || _need > _remaining) return 0; \
 } 
+
+inline void VMX_WriteStreamLen(BYTE* dst, int len) {
+	// Used to be `*(uint32_t*)b = len`: a 4-byte store through a uint32_t* into a BYTE buffer the
+	// caller owns. Strict-aliasing UB, and unaligned for every slice header after the first (the
+	// header is 3 or 5 bytes). memcpy of a local writes the same four bytes with defined behaviour.
+	const uint32_t wire = (uint32_t)len;
+	memcpy(dst, &wire, sizeof(wire));
+}
 
 inline void VMX_ConfigureInterlaced(VMX_INSTANCE* instance, int interlaced) {
 	instance->Format = VMX_FORMAT_PROGRESSIVE;
@@ -1208,9 +1227,17 @@ VMX_API void VMX_SetThreads(VMX_INSTANCE* instance, int numThreads)
 }
 VMX_API int VMX_SaveTo(VMX_INSTANCE* instance, BYTE* dst, int maxLen)
 {
-	if (!instance) return VMX_ERR_INVALID_INSTANCE;
-	if (!dst) return VMX_ERR_INVALID_PARAMETERS;
-	if (!maxLen) return VMX_ERR_INVALID_PARAMETERS;
+	// P0 #10 (from the desktop vendored copy): the contract of this function is "0 = failure,
+	// > 0 = bytes written" — that is what every caller tests. It used to answer a bad call with a
+	// POSITIVE VMX_ERR_* value: 5 for a null instance, 6 for a null dst or a zero length.
+	// Sender::encodeFrame() returned that straight through and Sender::send() only asked
+	// "encodedLen <= 0", so the caller got a FrameHeader + VideoExtHeader announcing a real video
+	// frame whose payload was the error code itself, queued and delivered to every subscriber on
+	// the link. Failure is 0 here, nothing else. (maxLen <= 0, not !maxLen: a negative capacity
+	// made maxB = dst + maxLen fall BELOW b, which the bounds macro then compared against.)
+	if (!instance) return 0;
+	if (!dst) return 0;
+	if (maxLen <= 0) return 0;
 
 	BYTE* b = dst;
 	BYTE* maxB = dst + maxLen;
@@ -1240,28 +1267,33 @@ VMX_API int VMX_SaveTo(VMX_INSTANCE* instance, BYTE* dst, int maxLen)
 		b[2] = slicecount;
 		b += 3;
 	}
+	// Signed on purpose. The desktop copy widened this to uint32_t, which turns a slice whose
+	// StreamPos sits below Stream (memory corruption, a codec bug) into len = 0xFFFFFFF8, and
+	// `len + 4` then wraps to 0 in 32-bit arithmetic on the way into the bounds macro. CHECKBUFF_SAVE
+	// refuses anything under 4 so that case cannot reach memcpy either way, but keeping len signed
+	// means the negative is visible here instead of depending on that one line of the macro.
 	int len = 0;
 	for (int i = 0; i < slicecount; i++)
 	{
 		VMX_SLICE_DATA d = instance->Slices[i]->DC;
-		len = d.StreamPos - d.Stream;
+		len = (int)(d.StreamPos - d.Stream);
 		CHECKBUFF_SAVE(len + 4);
-		*(uint32_t*)b = len;
+		VMX_WriteStreamLen(b, len);
 		b += 4;
-		memcpy(b, d.Stream, len);
+		memcpy(b, d.Stream, (size_t)len);
 		b += len;
 	}
 	for (int i = 0; i < slicecount; i++)
 	{
 		VMX_SLICE_DATA d = instance->Slices[i]->AC;
-		len = d.StreamPos - d.Stream;
+		len = (int)(d.StreamPos - d.Stream);
 		CHECKBUFF_SAVE(len + 4);
-		*(uint32_t*)b = len;
+		VMX_WriteStreamLen(b, len);
 		b += 4;
-		memcpy(b, d.Stream, len);
+		memcpy(b, d.Stream, (size_t)len);
 		b += len;
 	}
-	len = b - dst;
+	len = (int)(b - dst);
 	VMX_AdjustBitrate(instance, len);
 	return len;
 }

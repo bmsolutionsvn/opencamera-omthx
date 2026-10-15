@@ -18,7 +18,7 @@
 #include <unistd.h>
 #include <sstream>
 #include <cstdint>
-#include <climits>
+#include <climits>   // INT_MAX: VMX_SaveTo() takes its capacity as an int
 #include <cstdio>
 
 #ifdef __ANDROID__
@@ -389,8 +389,33 @@ int Sender::encodeFrame(const MediaFrame& frame) {
         return 0;
     }
     
-    int encodedLen = VMX_SaveTo(vmxInstance_, encodeBuffer_.data(), encodeBuffer_.size());
+    // P0 #10 (from the desktop vendored copy): VMX_SaveTo() now answers every failure with 0, but
+    // the sender is the party that stamps the FrameHeader, so the sender is also the party that
+    // must not put a payload length on the wire that it cannot point at. Anything outside
+    // (0, capacity] is a failure whatever the codec chose to call it — before this line existed,
+    // VMX_SaveTo's null-instance path returned VMX_ERR_INVALID_INSTANCE (5), encodeFrame() passed
+    // it straight back, send() only tested `encodedLen <= 0`, and a 5-byte "video frame" with a
+    // full FrameHeader + VideoExtHeader claiming 64x64@30 went out to every subscriber on the
+    // link. Desktop rejects the same two conditions in encodeFrameLocked
+    // (vendor/libomtcpp/src/OMTSender.cpp:546).
+    const size_t capacity = encodeBuffer_.size();
+    // VMX_SaveTo() takes its capacity as an int. Rounding a (never observed) oversized buffer DOWN
+    // in that direction can only make the codec write less, never more.
+    const int capacityInt = capacity > (size_t)INT_MAX ? INT_MAX : (int)capacity;
+    int encodedLen = VMX_SaveTo(vmxInstance_, encodeBuffer_.data(), capacityInt);
+    if (!encodedLenAcceptable(encodedLen, capacity)) {
+        LOGE("Sender::encodeFrame: VMX_SaveTo returned %d for a %zu byte encode buffer — refused",
+             encodedLen, capacity);
+        return 0;
+    }
     return encodedLen;
+}
+
+// The publishable range, spelled out so the host suite can assert it directly: a positive length
+// that fits inside the buffer we actually own. qa/build-host.sh neutralises this one line and the
+// suite must go red.
+bool Sender::encodedLenAcceptable(int encodedLen, size_t capacity) {
+    return encodedLen > 0 && static_cast<size_t>(encodedLen) <= capacity;
 }
 
 // The wire carries these numbers to every receiver in the ecosystem, and this project has

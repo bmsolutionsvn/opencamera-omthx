@@ -67,7 +67,25 @@ build_and_run() {
     sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
     rc=1; return
   fi
-  timeout 90 "$SCRATCH/$name" >"$SCRATCH/$name.run.log" 2>&1
+  score_run "$name" "$expect"
+}
+
+fresh_copy() { # <dir> — an isolated tree a mutant may deface
+  local d="$SCRATCH/$1"; rm -rf "$d"; mkdir -p "$d"
+  cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$d"/
+  echo "$d"
+}
+
+fresh_copy_vmx() { # <dir> — an isolated copy of the CODEC, for mutants that edit vmxcodec.cpp
+  local d="$SCRATCH/$1"; rm -rf "$d"; mkdir -p "$d"
+  cp "$ROOT"/libvmx/src/*.cpp "$ROOT"/libvmx/src/*.h "$d"/
+  echo "$d"
+}
+
+# score_run <binary-name> <expect pass|fail> — run the freshly built scenario and check it produced
+# the verdict we predicted for it.
+score_run() {
+  timeout 90 "$SCRATCH/$1" >"$SCRATCH/$1.run.log" 2>&1
   # The status must be captured in the SAME statement that reads $?: two earlier versions of this
   # line (`local got=pass; [ $? -ne 0 ]` and `local got; if [ $? ...`) each scored every run as a
   # pass, because the intervening `local` is itself a command and resets $? to 0. A harness that
@@ -75,19 +93,32 @@ build_and_run() {
   local status=$?
   local got=fail
   [ "$status" -eq 0 ] && got=pass
-  if [ "$got" = "$expect" ]; then
-    echo "  $name: $got as expected"
+  if [ "$got" = "$2" ]; then
+    echo "  $1: $got as expected"
   else
-    echo "  $name: $got but expected $expect  <-- PROBLEM"
-    sed 's/^/      /' "$SCRATCH/$name.run.log" | tail -18
+    echo "  $1: $got but expected $2  <-- PROBLEM"
+    sed 's/^/      /' "$SCRATCH/$1.run.log" | tail -18
     rc=1
   fi
 }
 
-fresh_copy() { # <dir> — an isolated tree a mutant may deface
-  local d="$SCRATCH/$1"; rm -rf "$d"; mkdir -p "$d"
-  cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$d"/
-  echo "$d"
+# build_and_run_vmx <name> <test.cpp> <omt-src-dir> <vmx-src-dir> <expect pass|fail>
+# Same as build_and_run, but the codec comes from a copy too — for scenarios whose whole point is a
+# mutated vmxcodec.cpp. (Headers still resolve to the tree; the mutants below only ever change .cpp.)
+build_and_run_vmx() {
+  local name=$1 test=$2 srcdir=$3 vmxdir=$4 expect=$5
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS $INC "$test" "$srcdir/OMTChannel.cpp" "$srcdir/OMTAsyncPool.cpp" \
+       "$srcdir/OMTSender.cpp" "$srcdir/OMTDiscovery.cpp" \
+       "$vmxdir/vmxcodec.cpp" "$vmxdir/vmxcodec_x86.cpp" "$vmxdir/vmxcodec_avx2.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
+    rc=1; return
+  fi
+  score_run "$name" "$expect"
 }
 
 echo "== slow-subscriber: a stalled Wi-Fi viewer must not take the stream down =="
@@ -221,6 +252,51 @@ assert s.count(old) == 1, "drop window not found"
 open(p, "w").write(s.replace(old, "    const int64_t delta = 0; (void)total;", 1))
 PY
 build_and_run dp-mutant-blind "$ROOT/qa/drop-policy.cpp" "$M4" fail
+
+echo
+echo "== vmx-saveto-contract: failure is 0, never a positive error code that reads as a frame =="
+build_and_run vs-fixed "$ROOT/qa/vmx-saveto-contract.cpp" "$ROOT/libomt/cpp" pass
+
+# MV1: the failure contract reverted. VMX_SaveTo answers a null instance / null dst / zero length
+# with VMX_ERR_INVALID_INSTANCE (5) and VMX_ERR_INVALID_PARAMETERS (6) again, and Sender::send() —
+# which tests `encodedLen <= 0` — puts a 5-byte payload behind a real FrameHeader on the wire.
+MV1=$(fresh_copy_vmx mutant-saveto-errcodes)
+python3 - "$MV1/vmxcodec.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\tif (!instance) return 0;\n\tif (!dst) return 0;\n\tif (maxLen <= 0) return 0;\n"
+assert s.count(old) == 1, "VMX_SaveTo failure contract not found"
+new = ("\tif (!instance) return VMX_ERR_INVALID_INSTANCE;\n"
+       "\tif (!dst) return VMX_ERR_INVALID_PARAMETERS;\n"
+       "\tif (!maxLen) return VMX_ERR_INVALID_PARAMETERS;\n")
+open(p, "w").write(s.replace(old, new, 1))
+PY
+build_and_run_vmx vs-mutant-saveto-errcodes "$ROOT/qa/vmx-saveto-contract.cpp" "$ROOT/libomt/cpp" "$MV1" fail
+
+# MV2: CHECKBUFF_SAVE back to the out-of-range pointer comparison. The negative-length probes in
+# part C then pass the bounds check and hand memcpy (size_t)(-8) and (size_t)(-4): ASan, not an
+# assertion. Both loops are probed because the macro is written out twice in VMX_SaveTo.
+MV2=$(fresh_copy_vmx mutant-checkbuff)
+python3 - "$MV2/vmxcodec.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\tif (_need < 4 || _need > _remaining) return 0; \\\n"
+assert s.count(old) == 1, "CHECKBUFF_SAVE remaining-bytes check not found"
+open(p, "w").write(s.replace(old, "\tif ((b + checkNumBytes) > maxB) return 0; \\\n", 1))
+PY
+build_and_run_vmx vs-mutant-checkbuff "$ROOT/qa/vmx-saveto-contract.cpp" "$ROOT/libomt/cpp" "$MV2" fail
+
+# MV4: the sender's own length gate disabled at the predicate. The codec bounds itself, so this is
+# the belt being tested on its own — which is only possible because the predicate is pure.
+MV4=$(fresh_copy mutant-saveto-predicate)
+python3 - "$MV4/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    return encodedLen > 0 && static_cast<size_t>(encodedLen) <= capacity;"
+assert s.count(old) == 1, "encodedLenAcceptable predicate not found"
+open(p, "w").write(s.replace(old, "    return true;  // MUTANT: any length the codec returns is publishable", 1))
+PY
+build_and_run vs-mutant-predicate "$ROOT/qa/vmx-saveto-contract.cpp" "$MV4" fail
 
 echo
 if [ $rc -ne 0 ]; then echo "QA FAILED"; exit 1; fi
