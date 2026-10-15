@@ -90,7 +90,14 @@ public class OMTStreamingManager {
     private static final String SERVICE_TYPE = "_omt._tcp";
 
     public OMTStreamingManager(Context context, StreamingCallback callback) {
-        this.context = context;
+        // getApplicationContext(), not the Activity: this object outlives it. The manager holds
+        // PowerManager/NsdManager handles derived from this context and runs a 1s monitor loop on
+        // a HandlerThread that only stops when isAnnouncing goes false — so retaining the Activity
+        // here keeps its whole view hierarchy (largeHeap is on) reachable from a thread the GC can
+        // never trim. That retained graph is the mechanism behind "the processes don't seem to
+        // terminate properly" in issue #9. NB: the StreamingCallback handed in by MainActivity is
+        // still an anonymous inner class over the Activity, so this alone does not fully unpin it.
+        this.context = context.getApplicationContext();
         this.callback = callback;
     }
 
@@ -139,7 +146,22 @@ public class OMTStreamingManager {
             omtSender.setSenderInfo(android.os.Build.MODEL, android.os.Build.MANUFACTURER);
 
             // Register mDNS service (with frequent announcements)
-            registerService(6400, name);
+            if (!registerService(6400, name)) {
+                // Was: registerService() swallowed every failure (its whole body sat in a try/catch
+                // that only logged) and isAnnouncing was set true regardless. The user saw
+                // "device is now discoverable" while nothing was advertised, and the guard at the
+                // top of this method refuses to try again while isAnnouncing is set — so the only
+                // way back was killing the process. That is the "sometimes OBS cannot detect the
+                // source" report from the phone's side, and it is unrecoverable by design.
+                Log.e(TAG, "mDNS registration failed - not announcing");
+                omtSender.cleanup();
+                omtSender = null;
+                cleanupAnnouncement();
+                if (callback != null) {
+                    callback.onStreamingError("mDNS registration failed - device is not discoverable");
+                }
+                return false;
+            }
 
             isAnnouncing = true;
             Log.i(TAG, "OMT announcement started - device is now discoverable");
@@ -504,7 +526,11 @@ public class OMTStreamingManager {
 
     // ===== Service Discovery =====
 
-    private void registerService(int port, String serviceName) {
+    /**
+     * @return true only if the registration request was accepted by NsdManager. A false here means
+     * the device is NOT discoverable; callers must not treat announcing as started.
+     */
+    private boolean registerService(int port, String serviceName) {
         try {
             // 1. Acquire Multicast Lock
             WifiManager wifiManager = (WifiManager) context.getApplicationContext()
@@ -550,7 +576,16 @@ public class OMTStreamingManager {
 
                 @Override
                 public void onRegistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {
+                    // Async half of registration: NsdManager accepted the call and mdnsd refused it
+                    // (duplicate name, malformed label, daemon trouble). Logging a code and moving on
+                    // left the UI claiming "discoverable"; tell the user, and clear the flag so
+                    // startAnnouncing() will actually try again instead of returning early forever.
                     Log.e(TAG, "NSD Registration failed: " + errorCode);
+                    isAnnouncing = false;
+                    if (callback != null) {
+                        callback.onStreamingError("mDNS registration failed (code " + errorCode +
+                                ") - device is not discoverable");
+                    }
                 }
 
                 @Override
@@ -567,10 +602,15 @@ public class OMTStreamingManager {
             if (nsdManager != null) {
                 nsdManager.registerService(serviceInfo, NsdManager.PROTOCOL_DNS_SD, registrationListener);
                 Log.i(TAG, "NSD registration initiated");
+                return true;
             }
+            Log.e(TAG, "NsdManager unavailable - the device will not be discoverable");
         } catch (Exception e) {
+            // Used to be the only report of a failed registration, and the caller set isAnnouncing
+            // true anyway.
             Log.e(TAG, "Failed during service registration", e);
         }
+        return false;
     }
 
     private void unregisterService() {
