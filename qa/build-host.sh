@@ -526,9 +526,14 @@ grep -q 'currentColorSpace_ == colorSpace' "$ROOT/libomt/cpp/OMTSender.cpp" \
   || { echo "  the tree does not contain the encoder-key fix — there is nothing to score"; rc=1; }
 build_and_run er-fixed "$ROOT/qa/encoder-reconfiguration.cpp" "$ROOT/libomt/cpp" pass
 
-ER_OLD=$(extract_libomt pre-fix-encoder "${QA_ER_BASE:-origin/master}")
+# PINNED, not origin/master: a moving ref here silently turns the must-fail control into a no-op the
+# day the fix lands upstream (exactly the defect class fixed for RPBASE/HPBASE today). d9814679 is the
+# commit this branch was written against and is genuinely pre-fix. Override with QA_ER_BASE=<rev>.
+BASE_ER=${QA_ER_BASE:-d9814679}
+require_rev "$BASE_ER" "pre-fix source of encoder-reconfiguration"
+ER_OLD=$(extract_libomt pre-fix-encoder "$BASE_ER")
 grep -q 'currentColorSpace_ == colorSpace' "$ER_OLD/OMTSender.cpp" \
-  && { echo "  the pre-fix copy ALREADY has the key fix — extraction from ${QA_ER_BASE:-origin/master} is wrong"; rc=1; }
+  && { echo "  the pre-fix copy ALREADY has the key fix — extraction from $BASE_ER is wrong"; rc=1; }
 build_and_run_tree er-prefix "$ROOT/qa/encoder-reconfiguration.cpp" "$ER_OLD" fail
 
 # ME1: the key clause alone, back out. This is the same regression as er-prefix, isolated to one
@@ -632,9 +637,9 @@ echo
 echo "== declaration-gate: no claim on the wire that the payload does not carry =="
 build_and_run dg-fixed "$ROOT/qa/declaration-gate.cpp" "$ROOT/libomt/cpp" pass STUB
 
-DG_OLD=$(extract_libomt pre-fix-decl "${QA_ER_BASE:-origin/master}")
+DG_OLD=$(extract_libomt pre-fix-decl "$BASE_ER")
 grep -q 'HighBitDepth claimed' "$DG_OLD/OMTSender.cpp" \
-  && { echo "  the pre-fix copy ALREADY has the flag gates — extraction from ${QA_ER_BASE:-origin/master} is wrong"; rc=1; }
+  && { echo "  the pre-fix copy ALREADY has the flag gates — extraction from $BASE_ER is wrong"; rc=1; }
 build_and_run_tree dg-prefix "$ROOT/qa/declaration-gate.cpp" "$DG_OLD" fail STUB
 
 # One mutant per new clause. Each is expected to let exactly its own case through.
