@@ -491,19 +491,26 @@ build_and_run sd-fixed "$ROOT/qa/stop-deadlock.cpp" "$ROOT/libomt/cpp" pass
 # tree (and the headers from the tree, so all TUs agree on Sender's layout — rule 15).
 PFS="$SCRATCH/pre-fix-stop"; rm -rf "$PFS"; mkdir -p "$PFS"
 cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$PFS"/
-git show "${QA_BASE:-fix/omt-announcement-truthfulness}:libomt/cpp/OMTSender.cpp" > "$PFS/OMTSender.cpp" \
-  || { echo "  cannot extract OMTSender.cpp from the base revision"; rc=1; }
-grep -q 'channels_.clear();' "$PFS/OMTSender.cpp" \
-  || { echo "  the pre-fix copy does not clear channels_ under the lock — extraction failed"; rc=1; }
-grep -q 'doomed.swap(channels_)' "$PFS/OMTSender.cpp" \
-  && { echo "  the pre-fix copy still defers the destruction — extraction failed"; rc=1; }
+# Pinned to d9814679 — the commit this branch sits on (the product commit's parent, master's tip
+# at audit time). The old default named fix/omt-announcement-truthfulness: a deletable branch
+# name, absent from fresh clones — and two PRs too old besides: its OMTSender.cpp could not even
+# compile against today's OMTSender.h (createEncoder changed signature in #18), which is why
+# this scenario arrived BUILD FAILED rather than red. The base's file is now exactly "this
+# branch's product commit, removed"; the headers stay the tree's so all TUs agree on Sender's
+# layout (rule 15), and the branch's only header change is the private→protected visibility of
+# the listener overrides the test subclass needs — definitions match either way.
+BASE_SD=${QA_BASE:-d9814679}
+extract_rev_file "$BASE_SD" "libomt/cpp/OMTSender.cpp" "$PFS/OMTSender.cpp"
+must_grep     "$PFS/OMTSender.cpp" 'channels_.clear();'
+must_not_grep "$PFS/OMTSender.cpp" 'doomed.swap(channels_)'
+
 build_and_run sd-prefix "$ROOT/qa/stop-deadlock.cpp" "$PFS" fail
 
 # SD1: the swap is kept and the lock is still released — but the destruction happens INSIDE the
 # scope. Proves the fix is the release, not the temporary vector: a reviewer who "improves" this by
 # moving doomed.clear() back into the block recreates the hang, and this mutant catches it.
 SD1=$(fresh_copy mutant-destroy-in-lock)
-python3 - "$SD1/OMTSender.cpp" <<'PY'
+if apply_mutant sd-mutant-destroy-in-lock "$SD1/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = ("        doomed.swap(channels_);\n    }\n    doomed.clear();")
@@ -512,19 +519,21 @@ new = ("        doomed.swap(channels_);\n        doomed.clear();  // MUTANT: joi
        "while still holding channelsMutex_\n    }")
 open(p, "w").write(s.replace(old, new, 1))
 PY
-build_and_run sd-mutant-destroy-in-lock "$ROOT/qa/stop-deadlock.cpp" "$SD1" fail
+then build_and_run sd-mutant-destroy-in-lock "$ROOT/qa/stop-deadlock.cpp" "$SD1" fail
+fi
 
 # SD2: copy the vector instead of swapping it. The channels stay referenced, so ~Channel() never
 # runs and stop() returns having torn nothing down — the other way a teardown fix goes wrong.
 SD2=$(fresh_copy mutant-copy-not-swap)
-python3 - "$SD2/OMTSender.cpp" <<'PY'
+if apply_mutant sd-mutant-copy-not-swap "$SD2/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "        doomed.swap(channels_);"
 assert s.count(old) == 1, "swap not found"
 open(p, "w").write(s.replace(old, "        doomed = channels_;  // MUTANT: unlink never happens", 1))
 PY
-build_and_run sd-mutant-copy-not-swap "$ROOT/qa/stop-deadlock.cpp" "$SD2" fail
+then build_and_run sd-mutant-copy-not-swap "$ROOT/qa/stop-deadlock.cpp" "$SD2" fail
+fi
 
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
