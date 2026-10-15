@@ -315,7 +315,42 @@ int Sender::encodeFrame(const MediaFrame& frame) {
     return encodedLen;
 }
 
+// The wire carries these numbers to every receiver in the ecosystem, and this project has
+// previously carried a second, contradictory set (BT601=1, BT709=2) in OMTProtocol.h. Pin the
+// values here so a silent renumbering is a compile error rather than a colour shift on OBS.
+static_assert(omt::ColorSpace::Undefined == 0 && omt::ColorSpace::BT601 == 601 &&
+              omt::ColorSpace::BT709 == 709,
+              "VideoExtHeader::colorSpace must use the OMT/VMX numbering (0/601/709)");
+
 int Sender::send(const MediaFrame& frame) {
+    // Fail closed on a colour space the encoder cannot honour, BEFORE anything else and before
+    // the no-clients shortcut. MediaFrame::colorSpace is a plain int and the wire header field is
+    // int32_t, so nothing in the type system stops a caller passing 2020 (which the OMT spec
+    // defines and this codec does not): createEncoder() would static_cast it straight into
+    // VMX_COLORSPACE — whose real values are only 0/601/709 — and send() would then stamp the
+    // same number into extHeader.colorSpace. The payload would be encoded with whatever the codec
+    // fell back to while the header told every receiver a different story. A same-codec loopback
+    // cannot see that: both ends share the fallback. Only the boundary can refuse it.
+    if (frame.colorSpace != ColorSpace::Undefined &&
+        frame.colorSpace != ColorSpace::BT601 &&
+        frame.colorSpace != ColorSpace::BT709) {  // wire numbering: 0/601/709, see OMTProtocol.h
+        const std::string why = "unsupported colorspace " + std::to_string(frame.colorSpace) +
+                                " (VMX encodes 601/709 only; the wire cannot carry a claim the payload does not match)";
+        setLastError(why);
+        LOGE("Sender::send: %s", why.c_str());
+        return 0;
+    }
+
+    // frameRateD is a divisor twice over in this path (createEncoder's ratio and the bitrate
+    // estimate below), and MediaFrame is a plain struct a caller fills by hand — leaving the
+    // denominator at 0 used to be a SIGFPE that took the camera process with it.
+    if (frame.frameRateD == 0) {
+        const std::string why = "frameRateD is 0 (frameRateN/frameRateD is a ratio; refusing to divide by zero)";
+        setLastError(why);
+        LOGE("Sender::send: %s", why.c_str());
+        return 0;
+    }
+
     // Cleanup disconnected first
     cleanupDisconnected();
     
@@ -328,7 +363,19 @@ int Sender::send(const MediaFrame& frame) {
     
     // Encode frame
     int encodedLen = encodeFrame(frame);
-    if (encodedLen <= 0) return 0;
+    if (encodedLen <= 0) {
+        // Was: return 0 in silence. The UI's drop rate comes from the per-channel counters, so a
+        // codec that kept failing looked like a healthy stream that nobody watched — frames left
+        // the camera and simply vanished without being counted as dropped anywhere.
+        encodeFailures_++;
+        const std::string why = "encoder produced no payload (codec " +
+                                std::to_string(frame.codec) + ", " + std::to_string(frame.width) + "x" +
+                                std::to_string(frame.height) + ")";
+        setLastError(why);
+        LOGE("Sender::send: %s (total encode failures %lld)", why.c_str(),
+             (long long)encodeFailures_.load());
+        return 0;
+    }
     
     totalEncodedBytes_ += encodedLen;
     int count = frameCount_++;

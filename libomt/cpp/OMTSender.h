@@ -101,6 +101,18 @@ public:
      * @return encoded frame size in bytes, or 0 on failure
      */
     int send(const MediaFrame& frame);
+
+    /**
+     * Why the last send() failed, or empty if it did not. The counters say what state we are in;
+     * this says why, so an operator can read the reason from the UI instead of attaching a
+     * debugger to a phone. (Codex-style rule: Status is the current phase, LastError is the reason.)
+     */
+    std::string lastError() const {
+        std::lock_guard<std::mutex> lock(errorMutex_);
+        return lastError_;
+    }
+    /// Frames the encoder refused. Without this they left the camera and were counted nowhere.
+    long long encodeFailures() const { return encodeFailures_.load(); }
     
     /**
      * Send metadata to all connected clients
@@ -176,6 +188,15 @@ private:
     // Statistics
     std::atomic<int64_t> totalEncodedBytes_{0};
     std::atomic<int> frameCount_{0};
+    std::atomic<int64_t> encodeFailures_{0};
+    // Written by whichever thread failed a send, read by the UI's stats poll — so it needs its own
+    // lock rather than riding on channelsMutex_, which the fan-out path holds while it queues.
+    mutable std::mutex errorMutex_;
+    std::string lastError_;
+    void setLastError(const std::string& why) {
+        std::lock_guard<std::mutex> lock(errorMutex_);
+        lastError_ = why;
+    }
     
     // Callbacks
     ConnectionCallback onConnect_;
