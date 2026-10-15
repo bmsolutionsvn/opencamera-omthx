@@ -574,34 +574,51 @@ public class OMTStreamingManager {
     }
 
     private void unregisterService() {
-        try {
-            if (nsdManager != null && registrationListener != null) {
+        // Each resource gets its own try/catch and its own null-out. They used to share a single
+        // try block, and NsdManager.unregisterService() throws IllegalArgumentException when the
+        // registration callback has not fired yet — exactly the "start, then immediately background
+        // or kill" sequence from issue #9. That exception jumped over every remaining statement, so
+        // the Wi-Fi, wake and multicast locks were never released nor nulled; the next
+        // startAnnouncing() then overwrote those fields with fresh lock objects, leaving a
+        // PARTIAL_WAKE_LOCK (acquired with no timeout) and a reference-counted MulticastLock held
+        // for the rest of the process's life. One failure must not be allowed to hide the rest.
+        if (nsdManager != null && registrationListener != null) {
+            try {
                 nsdManager.unregisterService(registrationListener);
-                registrationListener = null;
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to unregister NSD service", e);
             }
+            registrationListener = null;
+        }
 
-            if (wifiLock != null) {
-                if (wifiLock.isHeld())
-                    wifiLock.release();
-                wifiLock = null;
-                Log.i(TAG, "WiFi lock released");
+        if (wifiLock != null) {
+            try {
+                if (wifiLock.isHeld()) wifiLock.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to release WiFi lock", e);
             }
+            wifiLock = null;
+            Log.i(TAG, "WiFi lock released");
+        }
 
-            if (wakeLock != null) {
-                if (wakeLock.isHeld())
-                    wakeLock.release();
-                wakeLock = null;
-                Log.i(TAG, "WakeLock released");
+        if (wakeLock != null) {
+            try {
+                if (wakeLock.isHeld()) wakeLock.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to release WakeLock", e);
             }
+            wakeLock = null;
+            Log.i(TAG, "WakeLock released");
+        }
 
-            if (multicastLock != null) {
-                if (multicastLock.isHeld())
-                    multicastLock.release();
-                multicastLock = null;
-                Log.i(TAG, "Multicast lock released");
+        if (multicastLock != null) {
+            try {
+                if (multicastLock.isHeld()) multicastLock.release();
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to release multicast lock", e);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to unregister/release locks", e);
+            multicastLock = null;
+            Log.i(TAG, "Multicast lock released");
         }
     }
 }

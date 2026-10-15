@@ -1427,6 +1427,19 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         // and we want to avoid notifications hanging around
         cancelImageSavingNotification();
 
+        // OMT teardown belongs here, not in onStop/onPause. stopStreaming() deliberately keeps the
+        // DNS-SD announcement and the native sender alive (so the preview can restart without
+        // re-advertising), and stopAll() — the ONLY method that unregisters the service, releases
+        // the wake/wifi/multicast locks and destroys the native sender — had no caller anywhere in
+        // the app. That is issue #9: swipe the app away and a zombie process keeps holding port
+        // 6400 plus the _omt._tcp record; the relaunched app's bind() then fails with EADDRINUSE
+        // (SO_REUSEADDR does not help against a live listener), nativeInit returns false, and
+        // since registerService() runs only after a successful init, the phone stops appearing in
+        // OBS entirely until the device is rebooted.
+        if (omtStreamingManager != null) {
+            omtStreamingManager.stopAll();
+        }
+
         if (want_no_limits && navigation_gap != 0) {
             if (MyDebug.LOG)
                 Log.d(TAG, "clear FLAG_LAYOUT_NO_LIMITS");
