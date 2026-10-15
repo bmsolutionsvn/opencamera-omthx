@@ -477,6 +477,82 @@ PY
 then build_and_run_codec as-mutant-free-always "$ROOT/qa/aligned-stride.cpp" "$MA3" fail
 fi
 
+# Codec-only builder for this scenario: the test drives ThreadTask straight out of the header, and
+# the -I order puts the copy's headers ahead of the tree's so a mutant that edits thread_tasks.h is
+# really what gets compiled. Named for this section: the sibling branches add their own, so each
+# section stays independently mergeable.
+build_and_run_threadtask() { # <name> <test.cpp> <vmx-src-dir> <expect pass|fail>
+  local name=$1 test=$2 vmxdir=$3 expect=$4
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS -I"$vmxdir" $INC "$test" \
+       "$vmxdir/vmxcodec.cpp" "$vmxdir/vmxcodec_x86.cpp" "$vmxdir/vmxcodec_avx2.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
+    FAILED+=("$name(build-failed)"); rc=1; return
+  fi
+  score_run "$name" "$expect"
+}
+
+echo "== thread-task-join: Join() waits for the work, Destroy() waits for the thread =="
+build_and_run_threadtask tt-fixed "$ROOT/qa/thread-task-join.cpp" "$ROOT/libvmx/src" pass
+
+# The fix removed wholesale: thread_tasks.h from the commit this branch sits on. That copy already
+# carries the `delete[] tasks->tasks` line from df66b01f, so what goes red here is the Join half —
+# the bare condvar wait and the `running` read outside the mutex — and nothing else.
+PFT="$SCRATCH/vmx-prefix-join"; rm -rf "$PFT"; mkdir -p "$PFT"
+# Pinned to d2ab8ca8 — the old tip of fix/omt-input-validation-off-the-desktop, an ancestor of
+# master so always reachable (a branch NAME is deletable and absent from fresh clones).
+# thread_tasks.h has not moved since; QA_BASE overrides must name a commit.
+BASE_TT=${QA_BASE:-d2ab8ca8}
+cp "$ROOT"/libvmx/src/*.cpp "$ROOT"/libvmx/src/*.h "$PFT"/
+extract_rev_file "$BASE_TT" "libvmx/src/thread_tasks.h" "$PFT/thread_tasks.h"
+must_grep "$PFT/thread_tasks.h" $'\t\t\tcomplete.wait(lock);' 
+build_and_run_threadtask tt-prefix "$ROOT/qa/thread-task-join.cpp" "$PFT" fail
+
+# MJ1: Join back to the bare wait, TaskLoop left fixed. Red on J1 alone — the predicate, not the
+# thread bookkeeping, is what stops Join reporting "done" with tasks still queued.
+MJ1=$(fresh_copy_vmx mutant-bare-wait)
+if apply_mutant tt-mutant-bare-wait "$MJ1/thread_tasks.h" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\t\tcomplete.wait(lock, [this] { return queue.empty(); });"
+assert s.count(old) == 1, "Join predicate not found"
+new = ("\t\tif (queue.size() > 0)\n"
+       "\t\t\tcomplete.wait(lock);  // MUTANT: a spurious wake now means 'finished'")
+open(p, "w").write(s.replace(old, new, 1))
+PY
+then build_and_run_threadtask tt-mutant-bare-wait "$ROOT/qa/thread-task-join.cpp" "$MJ1" fail
+fi
+
+# MJ2: TaskLoop back to reading `running` outside the mutex, Join left fixed. Red on J3 alone:
+# Destroy can clear running and notify in the window before the worker reaches cv.wait, the worker
+# sleeps through the only wakeup it will ever get, and thread.join() never returns.
+MJ2=$(fresh_copy_vmx mutant-running-outside-lock)
+if apply_mutant tt-mutant-running-outside-lock "$MJ2/thread_tasks.h" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+i = s.index("\tvoid TaskLoop()")
+j = s.index("\tvoid Initialize()")
+old = s[i:j]
+assert "cv.wait(lock, [this]" in old, "TaskLoop predicate not found"
+new = ("\tvoid TaskLoop()\n\t{\n\t\twhile (running)  // MUTANT: read outside mtx — lost wakeup\n\t\t{\n"
+       "\t\t\tfor (volatile int spin = 0; spin < 300000; ++spin) {}  // MUTANT: widen the unlocked\n"
+       "\t\t\t// window so the lost wakeup is structural, not a coin flip (see qa/repeat-run.sh)\n"
+       "\t\t\tstd::unique_lock<std::mutex> lock(mtx);\n"
+       "\t\t\tif (queue.size() == 0)\n\t\t\t{\n\t\t\t\tcomplete.notify_all();\n\t\t\t\tcv.wait(lock);\n\t\t\t}\n"
+       "\t\t\tif (!running) break;\n\t\t\tstd::function<void()> func = NULL;\n"
+       "\t\t\tif (queue.size() > 0)\n\t\t\t{\n\t\t\t\tfunc = queue.front();\n\t\t\t\tqueue.pop();\n\t\t\t}\n"
+       "\t\t\tif (func)\n\t\t\t{\n\t\t\t\tfunc();\n\t\t\t}\n\t\t}\n\t}\n\n")
+open(p, "w").write(s[:i] + new + s[j:])
+PY
+then build_and_run_threadtask tt-mutant-running-outside-lock "$ROOT/qa/thread-task-join.cpp" "$MJ2" fail
+fi
+
+echo
+
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
   echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"
