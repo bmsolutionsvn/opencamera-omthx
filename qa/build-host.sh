@@ -85,22 +85,28 @@ require_rev() { # <rev> <what it captures> — the pinned pre-fix bases are immu
     || harness_die "base revision $1 ($2) is not reachable in this clone — the QA bases are pinned commits, not branch names; fetch the full history (git fetch --unshallow; git fetch origin; git fetch https://github.com/yd-zd/opencamera-omt '+refs/heads/*:refs/remotes/fork/*') and retry"
 }
 
-extract_rev_file() { # <rev> <path> <dest> — `git show ... > f` ALONE leaves an EMPTY f behind when
-                     # the rev or path is bad, and the scenario then dies in the linker looking
-                     # like a product defect; abort before that can happen
-  require_rev "$1" "source of $2"
+extract_rev_file() { # <rev> <path> <dest> [scenario] — `git show ... > f` ALONE leaves an EMPTY f
+                     # behind when the rev or path is bad, and the scenario then dies in the linker
+                     # looking like a product defect; abort before that can happen. The optional
+                     # scenario name rides into every message: an extraction that comes up empty is
+                     # the harness failing to express ONE control, and whoever reads the rc=2 must
+                     # not have to reverse-engineer which one out of a scratch path.
+  local why="source of $2"; [ -n "${4:-}" ] && why="$why for the $4 control"
+  local at=""; [ -n "${4:-}" ] && at=" ($4)"
+  require_rev "$1" "$why"
   git show "$1:$2" > "$3.part" 2>"$SCRATCH/git-show.err" \
-    || harness_die "git show $1:$2 failed: $(tr '\n' ' ' < "$SCRATCH/git-show.err")"
-  [ -s "$3.part" ] || harness_die "git show $1:$2 produced an empty file — refusing to build a scenario out of nothing"
+    || harness_die "git show $1:$2 failed$at: $(tr '\n' ' ' < "$SCRATCH/git-show.err")"
+  [ -s "$3.part" ] || harness_die "git show $1:$2 produced an empty file$at — refusing to build a scenario out of nothing"
   mv "$3.part" "$3"
 }
 
 # A pre-fix copy must be VERIFIABLY pre-fix: a pin that silently points after the fix turns a
 # must-fail scenario into a must-pass lie (that is exactly how `git show master:` rotted — PR #13
 # merged, master moved under the harness, and ss-prefix started passing the gate it exists to
-# prove). Grep the copy both ways: the old shape present, the fix absent.
-must_grep()     { grep -q "$2" "$1" || harness_die "pre-fix check: $1 lacks /$2/ — the extracted copy is not the pre-fix tree this scenario claims to run"; }
-must_not_grep() { if grep -q "$2" "$1"; then harness_die "pre-fix check: $1 still contains /$2/ — the gate was never removed; scoring this copy as a caught mutant would be a lie"; fi; }
+# prove). Grep the copy both ways: the old shape present, the fix absent. The optional third
+# argument names the scenario in the harness error, same reason as extract_rev_file's fourth.
+must_grep()     { grep -q "$2" "$1" || harness_die "pre-fix check${3:+ ($3)}: $1 lacks /$2/ — the extracted copy is not the pre-fix tree this scenario claims to run"; }
+must_not_grep() { if grep -q "$2" "$1"; then harness_die "pre-fix check${3:+ ($3)}: $1 still contains /$2/ — the gate was never removed; scoring this copy as a caught mutant would be a lie"; fi; }
 
 apply_mutant() { # <scenario> <file> — python patch text on stdin. An anchor that no longer
                  # matches means the gate was NEVER disabled: the copy is still the fixed code, and
@@ -110,6 +116,19 @@ apply_mutant() { # <scenario> <file> — python patch text on stdin. An anchor t
   mark_harness_err "$name: mutant could not be applied — the anchor is gone, so the gate was never disabled; refusing to score an unpatched copy"
   FAILED+=("$name(anchor-missing)")
   return 1
+}
+
+# apply_test_seam <scenario> <file> — restore the one thing an extracted pre-fix copy must not lose:
+# the visibility seam a scenario's subclass needs in order to reach the PRODUCTION implementation of
+# a callback it is trying to collide with. It is not a gate and reverting it does not revert a fix;
+# it is the test's ability to observe. Same stdin-patch discipline as apply_mutant, but it aborts
+# (rc=2) rather than continuing: without the seam the scenario cannot compile, and a control that
+# dies at the compiler is exactly the outcome this harness must never report as a verdict. The anchor
+# lives in a file pinned to an immutable commit, so it matches forever or it never did.
+apply_test_seam() {
+  local name=$1 f=$2
+  if python3 - "$f"; then return 0; fi
+  harness_die "$name: the test seam could not be restored in $f — the anchor is gone, so the extracted copy is not the shape this control was written against"
 }
 
 # build_and_run <binary-name> <test.cpp> <omt-source-dir> <expect pass|fail> [vmx-source-dir]
@@ -484,27 +503,108 @@ fi
 # therefore deadlocked against its own callback: stop() never returned, and MainActivity::onDestroy
 # -> stopAll() (PR #15) puts that on the UI thread. removeChannel()/cleanupDisconnected() already
 # unlink under the lock and destroy outside it — stop() was the path that did not.
+build_and_run_sender() { # <name> <test.cpp> <omt-src-dir> <expect pass|fail>
+  # Headers from the SAME copy as the sources — the rule build_and_run_channel encodes for Channel,
+  # applied to Sender. This pre-fix copy replaces OMTSender.h as well as OMTSender.cpp (a class and
+  # its out-of-line definitions are one program, see the pin note below), so the test and every TU
+  # must compile the class from the copy's header: linking the copy's .cpp against the tree's header
+  # reads channels_/encoderMutex_ at the wrong offsets, which is the hazard that once returned
+  # staleEvicted() == -4702111234474983746 — "not evidence of anything" (rule 15). The codec itself
+  # is not under test here and comes from the tree. Named for this section, like
+  # build_and_run_threadtask, so the sibling QA branches stay independently mergeable.
+  local name=$1 test=$2 srcdir=$3 expect=$4
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS -I"$srcdir" $INC "$test" "$srcdir/OMTChannel.cpp" "$srcdir/OMTAsyncPool.cpp" \
+       "$srcdir/OMTSender.cpp" "$srcdir/OMTDiscovery.cpp" \
+       "$ROOT/libvmx/src/vmxcodec.cpp" "$ROOT/libvmx/src/vmxcodec_x86.cpp" "$ROOT/libvmx/src/vmxcodec_avx2.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
+    FAILED+=("$name(build-failed)"); rc=1; return
+  fi
+  score_run "$name" "$expect"
+}
+
 echo "== stop-deadlock: teardown must not hold channelsMutex_ across ~Channel()'s join =="
 build_and_run sd-fixed "$ROOT/qa/stop-deadlock.cpp" "$ROOT/libomt/cpp" pass
 
-# The pre-fix run: OMTSender.cpp back at the revision this branch sits on, everything else from the
-# tree (and the headers from the tree, so all TUs agree on Sender's layout — rule 15).
+# The pre-fix run: the stop-deadlock fix removed — and removed as a PROGRAM, not as one file.
+#
+# A .cpp does not compile on its own: it is one half of a class whose other half is its own header,
+# so pinning OMTSender.cpp to a pre-fix revision while the headers stay the tree's asks the old
+# source to define the class the way TODAY declares it. That is exactly what rotted here. The
+# previous pin was d9814679 (set by 8af9fb33: master's tip at audit time, so pre-fix for the
+# deadlock), and when PR #29 (026d9d34) turned the private
+#     int encodeFrame(const MediaFrame& frame);
+# into
+#     int encodeFrame(const MediaFrame& frame, EncoderIdentity* used = nullptr);
+# the extracted file stopped matching its own class:
+#     error: out-of-line definition of 'encodeFrame' does not match any declaration in 'omt::Sender'
+# sd-prefix has been red as (build-failed) ever since. A must-fail control that dies at the compiler
+# is not a caught mutant — it is the harness failing to express the control, reported as though it
+# were a verdict, and the suite goes red for a reason that is not this gate.
+#
+# So both halves of the class come from ONE immutable revision, the way the aligned-stride section
+# already extracts vmxcodec_common.h together with the .cpp files that include it (BASE_A): a .cpp
+# and the header it was written against, pinned to the same commit, cannot drift apart again.
+#
+# That revision is 026d9d34 — not d74031e3^, and not "master's tip at audit time". d74031e3 (PR #24,
+# merged as 6905bae1) and 026d9d34 (PR #29, merged as dfc09582) are the only two commits that have
+# touched these two files since, they sit on sibling branches (d74031e3 is NOT an ancestor of
+# 026d9d34: the colour-space-key branch never saw the deadlock fix), so this pair is the tree with
+# EXACTLY the commit under test removed:
+#     diff(026d9d34..master, libomt/cpp/OMTSender.cpp) == the diff of d74031e3  (swap, then destroy)
+#     diff(026d9d34..master, libomt/cpp/OMTSender.h)   == the diff of d74031e3  (the seam, below)
+# Pinning d9814679 or d74031e3^ instead would ALSO remove PR #29's encoder-identity work from the
+# same translation unit — a second gate silently disabled in a scenario that is not about it, the
+# hazard the receiver-validation section names outright ("the scenario could have gone red for
+# reasons that are not this gate").
+BASE_SD=${QA_BASE:-026d9d34}
 PFS="$SCRATCH/pre-fix-stop"; rm -rf "$PFS"; mkdir -p "$PFS"
 cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$PFS"/
-# Pinned to d9814679 — the commit this branch sits on (the product commit's parent, master's tip
-# at audit time). The old default named fix/omt-announcement-truthfulness: a deletable branch
-# name, absent from fresh clones — and two PRs too old besides: its OMTSender.cpp could not even
-# compile against today's OMTSender.h (createEncoder changed signature in #18), which is why
-# this scenario arrived BUILD FAILED rather than red. The base's file is now exactly "this
-# branch's product commit, removed"; the headers stay the tree's so all TUs agree on Sender's
-# layout (rule 15), and the branch's only header change is the private→protected visibility of
-# the listener overrides the test subclass needs — definitions match either way.
-BASE_SD=${QA_BASE:-d9814679}
-extract_rev_file "$BASE_SD" "libomt/cpp/OMTSender.cpp" "$PFS/OMTSender.cpp"
-must_grep     "$PFS/OMTSender.cpp" 'channels_.clear();'
-must_not_grep "$PFS/OMTSender.cpp" 'doomed.swap(channels_)'
+extract_rev_file "$BASE_SD" "libomt/cpp/OMTSender.cpp" "$PFS/OMTSender.cpp" sd-prefix
+extract_rev_file "$BASE_SD" "libomt/cpp/OMTSender.h"   "$PFS/OMTSender.h"   sd-prefix
+must_grep     "$PFS/OMTSender.cpp" 'channels_.clear();'      sd-prefix
+must_not_grep "$PFS/OMTSender.cpp" 'doomed.swap(channels_)'  sd-prefix
+# Only the commit under test is reverted: PR #29's declaration builder is still in the .cpp and the
+# encoder identity it derives the wire from is still in the header. If a re-pin ever points the pair
+# at a revision that quietly drops #29 as well, these two lines say so — instead of the scenario
+# going red for a gate nobody is testing here.
+must_grep     "$PFS/OMTSender.cpp" 'buildVideoHeaders'       sd-prefix
+must_grep     "$PFS/OMTSender.h"   'EncoderIdentity'         sd-prefix
+# The one thing the pre-fix copy must NOT remove is the test's own observation point. d74031e3
+# widened the three IChannelListener overrides from private to protected because
+# qa/stop-deadlock.cpp's subclass chains to the PRODUCTION Sender::onQualityChanged() after parking
+# the receiver thread on a gate it controls; with the overrides private that qualified call is a
+# compile error ("'onQualityChanged' is a private member of 'omt::Sender'"), and a subclass that
+# re-implements the callback instead of calling it measures nothing — the deadlock would be tested
+# against a copy of the callback, not the callback. Reverting the fix must not revert the ability to
+# observe it, so the seam is restored on the extracted copy. Its anchor is text pinned to an
+# immutable commit: it matches forever or it never did, and apply_test_seam makes the second case a
+# harness error rather than the build failure this section just escaped.
+apply_test_seam sd-prefix "$PFS/OMTSender.h" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ("    // IChannelListener implementation\n"
+       "    void onDisconnected(Channel* channel) override;\n"
+       "    void onTallyChanged(Channel* channel) override;\n"
+       "    void onQualityChanged(Channel* channel) override;\n")
+assert s.count(old) == 1, "listener override block not found to widen"
+new = ("    // IChannelListener implementation — protected, not private: these are the override\n"
+       "    // points of a public interface, and qa/stop-deadlock.cpp chains to the production\n"
+       "    // callback. Restored by the harness; nothing else in this header was touched.\n"
+       "protected:\n"
+       "    void onDisconnected(Channel* channel) override;\n"
+       "    void onTallyChanged(Channel* channel) override;\n"
+       "    void onQualityChanged(Channel* channel) override;\n\n"
+       "private:\n")
+open(p, "w").write(s.replace(old, new, 1))
+PY
+must_grep "$PFS/OMTSender.h" '^protected:' sd-prefix
 
-build_and_run sd-prefix "$ROOT/qa/stop-deadlock.cpp" "$PFS" fail
+build_and_run_sender sd-prefix "$ROOT/qa/stop-deadlock.cpp" "$PFS" fail
 
 # SD1: the swap is kept and the lock is still released — but the destruction happens INSIDE the
 # scope. Proves the fix is the release, not the temporary vector: a reviewer who "improves" this by
