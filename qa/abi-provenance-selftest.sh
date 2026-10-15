@@ -16,6 +16,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 GATE="$HERE/abi-provenance.sh"
 APK=${1:-}
 [ -n "$APK" ] && [ -f "$APK" ] || { echo "usage: $0 <dual-abi apk>" >&2; exit 2; }
+# Absolute, because the ABI scan below runs from a scratch directory and a relative path would
+# silently resolve to nothing — which the scan then reports as "the APK packages no lib/
+# directories", a wrong answer that reads like a real finding.
+APK=$(readlink -f "$APK")
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 rc=0
