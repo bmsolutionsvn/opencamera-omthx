@@ -680,12 +680,38 @@ public class StorageUtils {
         return result;
     }
 
+    /** Sanitizes a user-supplied string for use as the prefix of a media filename.
+     *  The prefix comes from a preference (PreferenceKeys.SavePhotoPrefixPreferenceKey /
+     *  SaveVideoPrefixPreferenceKey), is concatenated straight into the filename, and the
+     *  filename is later resolved against the save directory (StorageUtils.createOutputMediaFile)
+     *  or handed to MediaStore as DISPLAY_NAME - path separators would let a crafted prefix such
+     *  as "../../shared_prefs/evil" escape the intended folder, e.g. into the app's private data
+     *  directory. Replacing separators with '_' keeps the file in the intended folder while
+     *  preserving the rest of the prefix verbatim.
+     */
+    public static String sanitizeFilenamePrefix(String prefix) {
+        if( prefix == null )
+            return "";
+        // we can't have slashes in the filename
+        prefix = prefix.replace('/', '_');
+        prefix = prefix.replace('\\', '_');
+        return prefix;
+    }
+
     String createMediaFilename(int type, String suffix, int count, String extension, Date current_date) {
+        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context);
+        return createMediaFilename(type, suffix, count, extension, current_date, sharedPreferences);
+    }
+
+    /** Overload taking the SharedPreferences explicitly, so unit tests can drive the
+     *  preference-derived filename handling without a live Context/PreferenceManager.
+     */
+    String createMediaFilename(int type, String suffix, int count, String extension, Date current_date,
+            SharedPreferences sharedPreferences) {
         String index = "";
         if( count > 0 ) {
             index = "_" + count; // try to find a unique filename
         }
-        SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(context);
         boolean useZuluTime = sharedPreferences.getString(PreferenceKeys.SaveZuluTimePreferenceKey, "local").equals("zulu");
         boolean includeMilliseconds = sharedPreferences.getBoolean(PreferenceKeys.SaveIncludeMillisecondsPreferenceKey, false);
         String dateFormatPattern = "yyyyMMdd_HHmmss";
@@ -707,11 +733,13 @@ public class StorageUtils {
             case MEDIA_TYPE_PRESHOT: // preshot videos still use same prefix as photos
             case MEDIA_TYPE_IMAGE: {
                 String prefix = sharedPreferences.getString(PreferenceKeys.SavePhotoPrefixPreferenceKey, "IMG_");
+                prefix = sanitizeFilenamePrefix(prefix);
                 mediaFilename = prefix + timeStamp + suffix + index + extension;
                 break;
             }
             case MEDIA_TYPE_VIDEO: {
                 String prefix = sharedPreferences.getString(PreferenceKeys.SaveVideoPrefixPreferenceKey, "VID_");
+                prefix = sanitizeFilenamePrefix(prefix);
                 mediaFilename = prefix + timeStamp + suffix + index + extension;
                 break;
             }
