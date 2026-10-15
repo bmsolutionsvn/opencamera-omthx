@@ -41,6 +41,51 @@ struct ChannelStats {
 };
 
 /**
+ * Why a channel stopped carrying traffic — the *reason*, not just the phase.
+ *
+ * `connected_ == false` on its own is unfalsifiable: a reviewer, an operator reading logcat, and
+ * a test asserting on teardown all need to know WHICH failure produced it. Before this existed a
+ * peer that sent dataLength = -16 and a peer that simply hung up were the same observable state,
+ * so the test could only assert "something happened" — and the spin/hang defect sat next to the
+ * EOF path for a whole audit cycle unnoticed.
+ *
+ * Values are append-only: they are part of what the host QA asserts on, so renumbering existing
+ * entries would silently retarget those assertions.
+ */
+enum class CloseReason : uint8_t {
+    None = 0,
+    PeerClosed,          ///< recv() returned 0: the peer closed its write half
+    RecvError,           ///< recv() failed with something other than EAGAIN
+    PollError,           ///< poll() failed with something other than EINTR
+    SendFailed,          ///< a write could not be completed inside its deadline
+    BadVersion,          ///< frame header version != 1
+    BadFrameType,        ///< a sender only accepts Metadata frames from a peer
+    NegativeDataLength,  ///< dataLength < 0 (signed int32 straight off the wire)
+    OversizedDataLength, ///< dataLength larger than any conforming control frame
+    MetadataLenTooBig,   ///< metadataLength does not fit inside dataLength
+    RecvBufferFull,      ///< bytes accumulated that no accepted frame can explain
+};
+
+/// Stable static strings: a log line or a UI toast may outlive the Channel, so the reason must
+/// never point into freed memory.
+inline const char* closeReasonToString(CloseReason r) {
+    switch (r) {
+        case CloseReason::PeerClosed:         return "peer closed";
+        case CloseReason::RecvError:          return "receiver: recv error";
+        case CloseReason::PollError:          return "receiver: poll error";
+        case CloseReason::SendFailed:         return "sender: write failed or timed out";
+        case CloseReason::BadVersion:         return "receiver: bad frame header version";
+        case CloseReason::BadFrameType:       return "receiver: unexpected peer frameType";
+        case CloseReason::NegativeDataLength: return "receiver: negative dataLength";
+        case CloseReason::OversizedDataLength:return "receiver: oversized dataLength";
+        case CloseReason::MetadataLenTooBig:  return "receiver: metadataLength larger than dataLength";
+        case CloseReason::RecvBufferFull:     return "receiver: receive buffer full without a consumable frame";
+        case CloseReason::None:               break;
+    }
+    return "none";
+}
+
+/**
  * Callback interface for channel events
  */
 class IChannelListener {
@@ -78,6 +123,17 @@ public:
     int64_t staleEvicted() const { return staleEvicted_.load(); }
     int64_t tornSends() const { return tornSends_.load(); }
     void disconnect();
+
+    /// Why this channel stopped carrying traffic. `None` until something names it.
+    CloseReason closeReason() const { return static_cast<CloseReason>(closeReason_.load()); }
+    const char* closeReasonName() const { return closeReasonToString(closeReason()); }
+    /// First writer wins: the reason the channel *died* is the one worth reporting, and the
+    /// bookkeeping that follows (the sender thread noticing a second later, the EOF that trails a
+    /// shutdown) must not overwrite it.
+    void noteCloseReason(CloseReason r) {
+        uint8_t expected = static_cast<uint8_t>(CloseReason::None);
+        closeReason_.compare_exchange_strong(expected, static_cast<uint8_t>(r));
+    }
     
     // Subscriptions
     Subscription getSubscriptions() const { return subscriptions_.load(); }
@@ -157,6 +213,9 @@ private:
     std::atomic<int64_t> tornSends_{0};
     std::atomic<int64_t> bytesSent_{0};
     std::atomic<int64_t> bytesReceived_{0};
+    /// CloseReason as a raw byte so it can be published from any thread without a lock; the
+    /// accessors above are the only readers, so the encoding never escapes the class.
+    std::atomic<uint8_t> closeReason_{0};
     
     // Listener
     IChannelListener* listener_;

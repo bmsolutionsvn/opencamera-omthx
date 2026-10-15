@@ -10,7 +10,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <netinet/tcp.h>
-#include <sys/select.h>
+// <sys/select.h> is gone with the select() call: receiverLoop() uses poll() now (see the comment
+// there), and leaving the header in place invited the FD_SETSIZE bug back.
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -25,6 +26,14 @@
 #endif
 
 namespace omt {
+
+namespace {
+/// The ceiling for a peer's control frame. metadataLength is a uint16 on the wire, so no
+/// conforming frame can describe a payload bigger than this; anything above it is either hostile
+/// or a frame type this direction does not accept. The receive buffer is sized from the same
+/// constant, so an accepted frame can never fail to fit.
+constexpr int32_t kMaxControlPayload = 65535;
+} // namespace
 
 Channel::Channel(int socketFd, struct sockaddr_in address, 
                  int sendBufferSize, IChannelListener* listener)
@@ -207,6 +216,7 @@ bool Channel::sendMetadataSync(const char* xml) {
         // Still holding sendSocketMutex_: a PARTIAL write leaves half a metadata record on the
         // stream, so the channel must be dead — and visibly dead — before any waiting video writer
         // can acquire the lock and append a full record behind the tear.
+        noteCloseReason(CloseReason::SendFailed);
         connected_ = false;
     }
     return ok;
@@ -390,82 +400,156 @@ bool Channel::sendAllBlocking(const uint8_t* data, size_t length) {
     // Under the lock, deliberately: whoever is waiting to write next must never get a turn in the
     // gap between a torn frame and the channel being marked dead, or it appends a clean record
     // behind the tear and the subscriber is mis-framed for the rest of the connection.
-    if (!ok) connected_ = false;
+    if (!ok) {
+        noteCloseReason(CloseReason::SendFailed);
+        connected_ = false;
+    }
     return ok;
 }
 
 void Channel::receiverLoop() {
     LOGI("receiverLoop: started");
-    
-    std::vector<uint8_t> recvBuffer(65536);
+
+    // Sized so that the largest frame the validation below can ACCEPT always fits in one buffer:
+    // 16 + kMaxControlPayload. That is what makes the "buffer is full" branch reachable only for a
+    // peer streaming bytes we have already refused to parse — with the old flat 65536 buffer a
+    // legitimate 65535-byte control frame could never be assembled, and the peer would be evicted
+    // for sending something conforming.
+    std::vector<uint8_t> recvBuffer(FrameHeader::SIZE + static_cast<size_t>(kMaxControlPayload));
     size_t bufferPos = 0;
-    
+
     while (running_ && connected_) {
-        fd_set readfds;
-        FD_ZERO(&readfds);
-        FD_SET(socketFd_, &readfds);
-        
-        struct timeval tv{0, 100000};  // 100ms
-        
-        int sel = select(socketFd_ + 1, &readfds, nullptr, nullptr, &tv);
-        
+        // socketFd_ is cleared by closeSocket()/disconnect() on another thread. FD_SET(-1) and
+        // poll(-1) are both undefined, so snapshot it once per iteration and bail if it is gone.
+        const int fd = socketFd_;
+        if (fd < 0) break;
+
+        // poll(), not select(). FD_SET() writes a bit into a STACK-resident fd_set sized for
+        // FD_SETSIZE (1024) descriptors, so for any accepted socket with fd >= 1024 — routine on a
+        // phone that has been up for a day, and routine in the host QA process — it wrote past the
+        // end of that array; ASan reports it as a stack-buffer-overflow inside receiverLoop. select()
+        // then refuses the call anyway (nfds > FD_SETSIZE). poll() has no descriptor ceiling.
+        struct pollfd pfd{fd, POLLIN, 0};
+        int sel = ::poll(&pfd, 1, 100);  // 100ms tick: running_ stays observable
+
         if (sel < 0) {
             if (errno == EINTR) continue;
+            LOGE("receiverLoop: poll error %d", errno);
+            noteCloseReason(CloseReason::PollError);
             connected_ = false;
             break;
         }
-        
+
         if (sel == 0) continue;
-        
-        ssize_t received = recv(socketFd_, recvBuffer.data() + bufferPos,
+
+        // Never call recv() with zero capacity: a full buffer means a peer is streaming a frame
+        // larger than kMaxControlPayload (already rejected at parse time) or we failed to drain.
+        if (bufferPos >= recvBuffer.size()) {
+            LOGE("receiverLoop: receive buffer full (%zu) without a consumable frame", bufferPos);
+            noteCloseReason(CloseReason::RecvBufferFull);
+            connected_ = false;
+            break;
+        }
+
+        ssize_t received = recv(fd, recvBuffer.data() + bufferPos,
                                 recvBuffer.size() - bufferPos, 0);
-        
+
         if (received <= 0) {
             if (received == 0) {
                 LOGI("receiverLoop: connection closed by peer");
+                noteCloseReason(CloseReason::PeerClosed);
             } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
                 LOGE("receiverLoop: recv error %d", errno);
+                noteCloseReason(CloseReason::RecvError);
             }
             connected_ = false;
             break;
         }
-        
+
         bytesReceived_ += received;
         bufferPos += received;
-        
+
         // Process complete frames
         while (bufferPos >= FrameHeader::SIZE) {
-            auto* header = reinterpret_cast<FrameHeader*>(recvBuffer.data());
-            
-            if (header->version != 1) {
-                LOGE("receiverLoop: invalid version %d", header->version);
+            // Re-check the flags EVERY iteration, inside the parse loop: ~Channel() joins this
+            // thread, and a peer that pipelines a batch of frames gets to decide how long that
+            // join takes otherwise.
+            if (!running_ || !connected_) break;
+
+            // Copy the header into a local BEFORE reading any field. recvBuffer.data() is
+            // attacker-controlled; the old reinterpret_cast<FrameHeader*> dereferenced it in place
+            // and, worse, fed its fields into arithmetic before anything checked them.
+            FrameHeader header;
+            std::memcpy(&header, recvBuffer.data(), FrameHeader::SIZE);
+
+            // Validate every field first. dataLength is a SIGNED int32 off the wire and the old
+            // `size_t totalFrameLen = FrameHeader::SIZE + header->dataLength` made dataLength = -16
+            // come out as totalFrameLen = 0: the shift at the bottom of this loop then consumed ZERO
+            // bytes, so the same 16 bytes were re-parsed forever — a permanent 100% CPU spin on a
+            // single TCP connect to port 6400, with no flag re-checked and no way out. ~Channel()
+            // joins this thread, so the app could not even tear the stream down: the only recovery
+            // was killing the process.
+            if (header.version != 1) {
+                LOGE("receiverLoop: invalid version %u", header.version);
+                noteCloseReason(CloseReason::BadVersion);
                 connected_ = false;
                 break;
             }
-            
-            size_t totalFrameLen = FrameHeader::SIZE + header->dataLength;
-            
-            if (totalFrameLen > bufferPos) break;
-            
+            // This is the SENDER's receive path: a peer may only send Metadata control frames
+            // (subscribe / tally / quality XML). Video or Audio here is malformed for this direction.
+            if (header.frameType != static_cast<uint8_t>(FrameType::Metadata)) {
+                LOGE("receiverLoop: unexpected peer frameType %u", header.frameType);
+                noteCloseReason(CloseReason::BadFrameType);
+                connected_ = false;
+                break;
+            }
+            if (header.dataLength < 0) {
+                LOGE("receiverLoop: negative dataLength %d", header.dataLength);
+                noteCloseReason(CloseReason::NegativeDataLength);
+                connected_ = false;
+                break;
+            }
+            if (header.dataLength > kMaxControlPayload) {
+                LOGE("receiverLoop: oversized control frame dataLength %d", header.dataLength);
+                noteCloseReason(CloseReason::OversizedDataLength);
+                connected_ = false;
+                break;
+            }
+            // metadataLength is uint16 and must fit inside the payload it claims to describe.
+            if (static_cast<int32_t>(header.metadataLength) > header.dataLength) {
+                LOGE("receiverLoop: metadataLength %u > dataLength %d",
+                     header.metadataLength, header.dataLength);
+                noteCloseReason(CloseReason::MetadataLenTooBig);
+                connected_ = false;
+                break;
+            }
+
+            // Both operands are non-negative and bounded here, so this cannot wrap or go negative.
+            const size_t totalFrameLen =
+                static_cast<size_t>(FrameHeader::SIZE) + static_cast<size_t>(header.dataLength);
+
+            if (totalFrameLen > bufferPos) break;  // wait for the rest of the frame
+
             // Process metadata
-            if (header->frameType == static_cast<uint8_t>(FrameType::Metadata) && 
-                header->dataLength > 0) {
+            if (header.dataLength > 0) {
                 char* xmlData = reinterpret_cast<char*>(recvBuffer.data() + FrameHeader::SIZE);
-                
+
                 // Fix for conflicting implementations:
                 // - C# libomtnet sends XML *without* null terminator
                 // - Protocol says null terminated
                 // - C++ sender sends *with* null terminator
-                size_t strLen = header->dataLength;
+                size_t strLen = header.dataLength;
                 if (strLen > 0 && xmlData[strLen - 1] == '\0') {
                     strLen--;
                 }
-                
+
                 std::string xml(xmlData, strLen);
                 processMetadata(xml);
             }
-            
-            // Shift buffer
+
+            // Shift buffer. Every frame that reaches this point has dataLength >= 0, so
+            // totalFrameLen >= FrameHeader::SIZE and bufferPos strictly decreases by at least 16 —
+            // the zero-progress loop the old code could enter is not reachable from here.
             if (totalFrameLen < bufferPos) {
                 memmove(recvBuffer.data(), recvBuffer.data() + totalFrameLen,
                         bufferPos - totalFrameLen);
@@ -473,7 +557,7 @@ void Channel::receiverLoop() {
             bufferPos -= totalFrameLen;
         }
     }
-    
+
     LOGI("receiverLoop: exiting");
     
     // Notify listener
