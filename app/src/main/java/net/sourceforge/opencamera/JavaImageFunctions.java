@@ -2308,24 +2308,33 @@ public class JavaImageFunctions {
         private final int n_tiles;
         private final int width;
         private final int height;
-        private final int [] c_histogram;
+        private final int [] equal_value_lut; // getEqualValue() precomputed for every (tile, value)
 
+        /** The histogram is frozen at construction: the LUT is built once here and apply()
+         *  never reads c_histogram again. The sole caller (HDRProcessor.adjustHistogram) fully
+         *  populates c_histogram before constructing this function and never mutates the array
+         *  afterwards, so this is behaviour-preserving; HistogramLutTest pins both the bit-for-bit
+         *  equality with the old lazy getEqualValue() (including the NaN/Inf (int)-cast behaviour
+         *  for empty tiles) and that two instances never share a LUT.
+         */
         AdjustHistogramApplyFunction(float hdr_alpha, int n_tiles, int width, int height, int [] c_histogram) {
             this.hdr_alpha = hdr_alpha;
             this.n_tiles = n_tiles;
             this.width = width;
             this.height = height;
-            this.c_histogram = c_histogram;
-        }
-
-        private int getEqualValue(int histogram_offset, int value) {
-            int cdf_v = c_histogram[histogram_offset+value];
-            int cdf_0 = c_histogram[histogram_offset];
-            int n_pixels = c_histogram[histogram_offset+255];
-            float num = (float)(cdf_v - cdf_0);
-            float den = (float)(n_pixels - cdf_0);
-            int equal_value = (int)( 255.0f * (num/den) ); // value that we should choose to fully equalise the histogram
-            return equal_value;
+            this.equal_value_lut = new int[n_tiles*n_tiles*256];
+            for(int i=0;i<n_tiles*n_tiles;i++) {
+                int histogram_offset = 256*i;
+                int cdf_0 = c_histogram[histogram_offset];
+                int n_pixels = c_histogram[histogram_offset+255];
+                float den = (float)(n_pixels - cdf_0);
+                for(int value=0;value<256;value++) {
+                    int cdf_v = c_histogram[histogram_offset+value];
+                    float num = (float)(cdf_v - cdf_0);
+                    int equal_value = (int)( 255.0f * (num/den) ); // value that we should choose to fully equalise the histogram
+                    this.equal_value_lut[histogram_offset+value] = equal_value;
+                }
+            }
         }
 
         @Override
@@ -2369,10 +2378,10 @@ public class JavaImageFunctions {
                         int histogram_offset10 = 256*((ix+1)*n_tiles+iy);
                         int histogram_offset01 = 256*(ix*n_tiles+iy+1);
                         int histogram_offset11 = 256*((ix+1)*n_tiles+iy+1);
-                        int equal_value00 = getEqualValue(histogram_offset00, value);
-                        int equal_value10 = getEqualValue(histogram_offset10, value);
-                        int equal_value01 = getEqualValue(histogram_offset01, value);
-                        int equal_value11 = getEqualValue(histogram_offset11, value);
+                        int equal_value00 = equal_value_lut[histogram_offset00+value];
+                        int equal_value10 = equal_value_lut[histogram_offset10+value];
+                        int equal_value01 = equal_value_lut[histogram_offset01+value];
+                        int equal_value11 = equal_value_lut[histogram_offset11+value];
                         float alpha = tx - ix;
                         float beta = ty - iy;
 
@@ -2384,8 +2393,8 @@ public class JavaImageFunctions {
                         int this_y = (iy<0) ? iy+1 : iy;
                         int histogram_offset0 = 256*(ix*n_tiles+this_y);
                         int histogram_offset1 = 256*((ix+1)*n_tiles+this_y);
-                        int equal_value0 = getEqualValue(histogram_offset0, value);
-                        int equal_value1 = getEqualValue(histogram_offset1, value);
+                        int equal_value0 = equal_value_lut[histogram_offset0+value];
+                        int equal_value1 = equal_value_lut[histogram_offset1+value];
                         float alpha = tx - ix;
                         equal_value = (int)((1.0f-alpha)*equal_value0 + alpha*equal_value1);
                     }
@@ -2393,8 +2402,8 @@ public class JavaImageFunctions {
                         int this_x = (ix<0) ? ix+1 : ix;
                         int histogram_offset0 = 256*(this_x*n_tiles+iy);
                         int histogram_offset1 = 256*(this_x*n_tiles+iy+1);
-                        int equal_value0 = getEqualValue(histogram_offset0, value);
-                        int equal_value1 = getEqualValue(histogram_offset1, value);
+                        int equal_value0 = equal_value_lut[histogram_offset0+value];
+                        int equal_value1 = equal_value_lut[histogram_offset1+value];
                         float beta = ty - iy;
                         equal_value = (int)((1.0f-beta)*equal_value0 + beta*equal_value1);
                     }
@@ -2402,7 +2411,7 @@ public class JavaImageFunctions {
                         int this_x = (ix<0) ? ix+1 : ix;
                         int this_y = (iy<0) ? iy+1 : iy;
                         int histogram_offset = 256*(this_x*n_tiles+this_y);
-                        equal_value = getEqualValue(histogram_offset, value);
+                        equal_value = equal_value_lut[histogram_offset+value];
                     }
 
                     int new_value = (int)( (1.0f-hdr_alpha) * value + hdr_alpha * equal_value );
@@ -2460,10 +2469,10 @@ public class JavaImageFunctions {
                         int histogram_offset10 = 256*((ix+1)*n_tiles+iy);
                         int histogram_offset01 = 256*(ix*n_tiles+iy+1);
                         int histogram_offset11 = 256*((ix+1)*n_tiles+iy+1);
-                        int equal_value00 = getEqualValue(histogram_offset00, value);
-                        int equal_value10 = getEqualValue(histogram_offset10, value);
-                        int equal_value01 = getEqualValue(histogram_offset01, value);
-                        int equal_value11 = getEqualValue(histogram_offset11, value);
+                        int equal_value00 = equal_value_lut[histogram_offset00+value];
+                        int equal_value10 = equal_value_lut[histogram_offset10+value];
+                        int equal_value01 = equal_value_lut[histogram_offset01+value];
+                        int equal_value11 = equal_value_lut[histogram_offset11+value];
                         float alpha = tx - ix;
                         float beta = ty - iy;
 
@@ -2475,8 +2484,8 @@ public class JavaImageFunctions {
                         int this_y = (iy<0) ? iy+1 : iy;
                         int histogram_offset0 = 256*(ix*n_tiles+this_y);
                         int histogram_offset1 = 256*((ix+1)*n_tiles+this_y);
-                        int equal_value0 = getEqualValue(histogram_offset0, value);
-                        int equal_value1 = getEqualValue(histogram_offset1, value);
+                        int equal_value0 = equal_value_lut[histogram_offset0+value];
+                        int equal_value1 = equal_value_lut[histogram_offset1+value];
                         float alpha = tx - ix;
                         equal_value = (int)((1.0f-alpha)*equal_value0 + alpha*equal_value1);
                     }
@@ -2484,8 +2493,8 @@ public class JavaImageFunctions {
                         int this_x = (ix<0) ? ix+1 : ix;
                         int histogram_offset0 = 256*(this_x*n_tiles+iy);
                         int histogram_offset1 = 256*(this_x*n_tiles+iy+1);
-                        int equal_value0 = getEqualValue(histogram_offset0, value);
-                        int equal_value1 = getEqualValue(histogram_offset1, value);
+                        int equal_value0 = equal_value_lut[histogram_offset0+value];
+                        int equal_value1 = equal_value_lut[histogram_offset1+value];
                         float beta = ty - iy;
                         equal_value = (int)((1.0f-beta)*equal_value0 + beta*equal_value1);
                     }
@@ -2493,7 +2502,7 @@ public class JavaImageFunctions {
                         int this_x = (ix<0) ? ix+1 : ix;
                         int this_y = (iy<0) ? iy+1 : iy;
                         int histogram_offset = 256*(this_x*n_tiles+this_y);
-                        equal_value = getEqualValue(histogram_offset, value);
+                        equal_value = equal_value_lut[histogram_offset+value];
                     }
 
                     int new_value = (int)( (1.0f-hdr_alpha) * value + hdr_alpha * equal_value );
