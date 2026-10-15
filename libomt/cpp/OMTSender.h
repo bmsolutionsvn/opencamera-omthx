@@ -111,8 +111,20 @@ public:
         std::lock_guard<std::mutex> lock(errorMutex_);
         return lastError_;
     }
-    /// Frames the encoder refused. Without this they left the camera and were counted nowhere.
+    /// Frames the sender refused to emit a payload for — an invalid frame, an encoder that could
+    /// not be created, or an encode that produced nothing. Without this they left the camera and
+    /// were counted nowhere.
     long long encodeFailures() const { return encodeFailures_.load(); }
+
+    // Test seams for the host QA suite (qa/frame-validation.cpp). Both gates are static, pure and
+    // side-effect-free, so the suite can assert each clause on its own instead of inferring it
+    // from socket timing. No production path calls them.
+    static bool validateFrameForTest(const MediaFrame& frame, std::string& why) {
+        return validateFrame(frame, why);
+    }
+    static size_t encodeBufferCapacityForTest(int width, int height) {
+        return encodeBufferCapacity(width, height);
+    }
     /// Drops across all subscribers since the previous call (per-second congestion view).
     int64_t getRecentDropsAndReset();
     
@@ -214,9 +226,21 @@ private:
     void cleanupDisconnected();
     
     // Encoder management
-    void createEncoder(int width, int height, int frameRate, int colorSpace);
+    // createEncoder reports why it could not create via `why` (send() owns lastError), and only
+    // publishes the size cache once an encoder actually exists. Returns false on failure.
+    bool createEncoder(int width, int height, int frameRate, int colorSpace, std::string& why);
     void destroyEncoder();
     int encodeFrame(const MediaFrame& frame);
+
+    // Every field of MediaFrame is filled by hand by whoever calls omt_send() — the JNI bridge
+    // copies Camera2 plane row-strides straight in — and encodeFrame() then hands frame.data to
+    // VMX, which walks it using frame.stride for BOTH planes. A device whose UV row stride differs
+    // from its Y row stride (ordinary ImageReader padding) therefore made the encoder read past
+    // the end of the ImageReader allocation: a SIGSEGV in the camera process, on an unknown
+    // device, with nothing in the log. This gate runs before the first allocation or VMX call.
+    // (P0 #9 / P0 #16, from the desktop vendored sender.)
+    static bool validateFrame(const MediaFrame& frame, std::string& why);
+    static size_t encodeBufferCapacity(int width, int height);
     
     // Buffer size calculation
     static int calculateOptimalBuffer(int width, int height, int profile);

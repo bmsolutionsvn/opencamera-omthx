@@ -126,8 +126,12 @@ int main() {
        "B1: an unknown codec is refused");
     ok(sender.encodeFailures() == before + 1,
        "B2: and the failure is COUNTED — a codec that keeps failing must show up in the numbers");
-    ok(has(sender.lastError(), "encoder produced no payload"),
-       "B3: with a reason an operator can read without a debugger");
+    ok(has(sender.lastError(), "unknown codec"),
+       "B3: with a reason an operator can read without a debugger. (The wording moved when "
+       "Sender::validateFrame() started catching the unknown codec at the boundary instead of in "
+       "encodeFrame's default branch — the reason is now the fourCC, which is more specific. The "
+       "generic \"encoder produced no payload\" message still has to fire for the case it was "
+       "written for, an encoder that exists and yields nothing: qa/encoder-create-failure.cpp D9.)");
 
     close(fd);
     sender.stop();
