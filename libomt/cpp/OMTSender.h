@@ -256,11 +256,19 @@ private:
     // Congestion Control
     void checkCongestion();
     
-    // IChannelListener implementation
+    // IChannelListener implementation.
+    //
+    // protected, not private: these are the override points of a public interface. The host QA
+    // scenario in qa/stop-deadlock.cpp has to observe the receiver thread ENTER onQualityChanged()
+    // and then hand control back to the production implementation; with the override private, a
+    // derived class has to re-implement the callback instead of testing it, and a re-implementation
+    // is exactly how a deadlock test ends up proving nothing.
+protected:
     void onDisconnected(Channel* channel) override;
     void onTallyChanged(Channel* channel) override;
     void onQualityChanged(Channel* channel) override;
-    
+
+private:
     // Profile selection
     int selectProfile(Quality quality) const;
 };

@@ -104,26 +104,46 @@ bool Sender::start() {
 }
 
 void Sender::stop() {
-    if (!running_.load()) return;
-    
-    running_ = false;
-    
+    // One owner of the teardown. compare_exchange, not load-then-store: two threads that both
+    // passed the `if (!running_)` test would both reach the channel destruction below and both
+    // join the same threads, and a re-entrant call — a listener callback that reaches stopAll(),
+    // which is exactly what MainActivity::onDestroy does through JNI — must be a no-op rather than
+    // a second pass that joins a thread the owner is already waiting on.
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false)) return;
+
     if (serverSocket_ > 0) {
         shutdown(serverSocket_, SHUT_RDWR);
         close(serverSocket_);
         serverSocket_ = -1;
     }
-    
+
     if (acceptThread_.joinable()) {
         acceptThread_.join();
     }
-    
-    // Disconnect all channels
+
+    // Disconnect all channels: unlink fast, destroy OUTSIDE the critical section. This is the same
+    // rule removeChannel() and cleanupDisconnected() already follow, and the one stop() broke.
+    //
+    // ~Channel() joins the receiver thread. That thread is very plausibly inside
+    // listener_->onQualityChanged() at this exact moment — a subscriber sending
+    // <OMTSettings Quality="..."/> is what puts it there — and Sender::onQualityChanged() calls
+    // getBestSuggestedQuality(), which takes channelsMutex_. Clearing the vector under the lock
+    // therefore self-deadlocks: stop() holds channelsMutex_ and waits to join a thread that is
+    // waiting for channelsMutex_. The UI thread reaches this through MainActivity::onDestroy ->
+    // stopAll() (PR #15), so the app hangs on teardown instead of closing, and the wake-up that
+    // never comes is the process being killed.
+    //
+    // The shared_ptr shape is deliberate: the fan-out paths hold references while the lock is
+    // released, so a channel must survive until every reference is gone. doomed going out of scope
+    // is what runs ~Channel(), with no lock held and after the callback has been allowed to finish.
+    std::vector<std::shared_ptr<Channel>> doomed;
     {
         std::lock_guard<std::mutex> lock(channelsMutex_);
-        channels_.clear();
+        doomed.swap(channels_);
     }
-    
+    doomed.clear();
+
     LOGI("Sender: stopped");
 }
 

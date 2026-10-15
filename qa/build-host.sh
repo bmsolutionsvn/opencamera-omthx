@@ -476,6 +476,55 @@ open(p, "w").write(s.replace(old, "\tif (true)  // MUTANT: ownership ignored\n\t
 PY
 then build_and_run_codec as-mutant-free-always "$ROOT/qa/aligned-stride.cpp" "$MA3" fail
 fi
+# ==================================================================================================
+# stop-deadlock: Sender::stop() must not destroy channels while it holds channelsMutex_.
+# ~Channel() joins the receiver thread; that thread is inside listener_->onQualityChanged() whenever
+# a subscriber has just sent <OMTSettings Quality="..."/>, and Sender::onQualityChanged() calls
+# getBestSuggestedQuality(), which takes the SAME mutex. The old `channels_.clear()` under the lock
+# therefore deadlocked against its own callback: stop() never returned, and MainActivity::onDestroy
+# -> stopAll() (PR #15) puts that on the UI thread. removeChannel()/cleanupDisconnected() already
+# unlink under the lock and destroy outside it — stop() was the path that did not.
+echo "== stop-deadlock: teardown must not hold channelsMutex_ across ~Channel()'s join =="
+build_and_run sd-fixed "$ROOT/qa/stop-deadlock.cpp" "$ROOT/libomt/cpp" pass
+
+# The pre-fix run: OMTSender.cpp back at the revision this branch sits on, everything else from the
+# tree (and the headers from the tree, so all TUs agree on Sender's layout — rule 15).
+PFS="$SCRATCH/pre-fix-stop"; rm -rf "$PFS"; mkdir -p "$PFS"
+cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$PFS"/
+git show "${QA_BASE:-fix/omt-announcement-truthfulness}:libomt/cpp/OMTSender.cpp" > "$PFS/OMTSender.cpp" \
+  || { echo "  cannot extract OMTSender.cpp from the base revision"; rc=1; }
+grep -q 'channels_.clear();' "$PFS/OMTSender.cpp" \
+  || { echo "  the pre-fix copy does not clear channels_ under the lock — extraction failed"; rc=1; }
+grep -q 'doomed.swap(channels_)' "$PFS/OMTSender.cpp" \
+  && { echo "  the pre-fix copy still defers the destruction — extraction failed"; rc=1; }
+build_and_run sd-prefix "$ROOT/qa/stop-deadlock.cpp" "$PFS" fail
+
+# SD1: the swap is kept and the lock is still released — but the destruction happens INSIDE the
+# scope. Proves the fix is the release, not the temporary vector: a reviewer who "improves" this by
+# moving doomed.clear() back into the block recreates the hang, and this mutant catches it.
+SD1=$(fresh_copy mutant-destroy-in-lock)
+python3 - "$SD1/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ("        doomed.swap(channels_);\n    }\n    doomed.clear();")
+assert s.count(old) == 1, "deferred destruction not found"
+new = ("        doomed.swap(channels_);\n        doomed.clear();  // MUTANT: joined the receiver "
+       "while still holding channelsMutex_\n    }")
+open(p, "w").write(s.replace(old, new, 1))
+PY
+build_and_run sd-mutant-destroy-in-lock "$ROOT/qa/stop-deadlock.cpp" "$SD1" fail
+
+# SD2: copy the vector instead of swapping it. The channels stay referenced, so ~Channel() never
+# runs and stop() returns having torn nothing down — the other way a teardown fix goes wrong.
+SD2=$(fresh_copy mutant-copy-not-swap)
+python3 - "$SD2/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "        doomed.swap(channels_);"
+assert s.count(old) == 1, "swap not found"
+open(p, "w").write(s.replace(old, "        doomed = channels_;  // MUTANT: unlink never happens", 1))
+PY
+build_and_run sd-mutant-copy-not-swap "$ROOT/qa/stop-deadlock.cpp" "$SD2" fail
 
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
