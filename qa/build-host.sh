@@ -728,6 +728,109 @@ mutate_bridge "$MP5" \
   "UV plane at the wrong offset"
 build_planar pc-mutant-uv-offset fail -I"$MP5"
 
+# Channel scenarios, with the HEADERS taken from the same copy as the sources. build_and_run resolves
+# includes against the tree, which is fine while a mutant changes only .cpp; here the pre-fix copy
+# changes Channel's member layout (sendSocketMutex_ is a member), and a test built against the tree's
+# header while linking the copy's .cpp reads members at the wrong offsets — the counters came back as
+# -4702111234474983746 the first time, which is not evidence of anything.
+build_and_run_channel() { # <name> <test.cpp> <omt-src-dir> <expect pass|fail>
+  local name=$1 test=$2 srcdir=$3 expect=$4
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS -I"$srcdir" $INC "$test" "$srcdir/OMTChannel.cpp" "$srcdir/OMTAsyncPool.cpp" \
+       "$srcdir/OMTSender.cpp" "$srcdir/OMTDiscovery.cpp" \
+       "$ROOT/libvmx/src/vmxcodec.cpp" "$ROOT/libvmx/src/vmxcodec_x86.cpp" "$ROOT/libvmx/src/vmxcodec_avx2.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
+    FAILED+=("$name(build-failed)"); rc=1; return
+  fi
+  score_run "$name" "$expect"
+}
+
+echo "== socket-write-order: one writer per channel, one deadline per write =="
+build_and_run_channel sw-fixed "$ROOT/qa/socket-write-order.cpp" "$ROOT/libomt/cpp" pass
+
+# The fix removed wholesale: OMTChannel.cpp/.h from the commit this branch sits on — i.e. the tree
+# that already has sendWithDeadline (45b8b48e) and nothing else. OMTConstants.h is deliberately
+# left alone: the scenario asserts against the new budgets by name, and reverting the header that
+# merely declares them would fail the BUILD rather than the gate.
+# Pinned to d2ab8ca8 — the commit this branch sat on (old tip of
+# fix/omt-input-validation-off-the-desktop, an ancestor of master so always reachable): the
+# tree that already has sendWithDeadline (45b8b48e) and nothing else. A branch NAME is
+# deletable and absent from fresh clones; QA_BASE overrides must name a commit, not a moving ref.
+BASE_SW=${QA_BASE:-d2ab8ca8}
+PFS="$SCRATCH/pre-fix-write"; rm -rf "$PFS"; mkdir -p "$PFS"
+cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$PFS"/
+for f in OMTChannel.cpp OMTChannel.h; do
+  extract_rev_file "$BASE_SW" "libomt/cpp/$f" "$PFS/$f"
+done
+must_not_grep "$PFS/OMTChannel.cpp" 'sendSocketMutex_'
+must_grep     "$PFS/OMTChannel.cpp" 'sendWithDeadline'
+build_and_run_channel sw-prefix "$ROOT/qa/socket-write-order.cpp" "$PFS" fail
+
+# MS1: the video writer stops taking the write lock. The metadata writer still tries, but a lock
+# nobody else holds is not serialisation — this is the mis-framing defect in one line.
+MS1=$(fresh_copy mutant-video-unlocked)
+if apply_mutant sw-mutant-video-unlocked "$MS1/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    std::lock_guard<std::mutex> writeLock(sendSocketMutex_);\n    const int fd = socketFd_;"
+assert s.count(old) == 1, "sendAllBlocking write lock not found"
+open(p, "w").write(s.replace(old, "    // MUTANT: the async video writer writes without the lock\n    const int fd = socketFd_;", 1))
+PY
+then build_and_run_channel sw-mutant-video-unlocked "$ROOT/qa/socket-write-order.cpp" "$MS1" fail
+fi
+
+# MS2: the metadata writer stops taking the lock (and stops bounding its acquisition). Same defect,
+# other direction: a handshake or a tally broadcast during streaming is enough to tear the stream.
+MS2=$(fresh_copy mutant-metadata-unlocked)
+if apply_mutant sw-mutant-metadata-unlocked "$MS2/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    while (!sendSocketMutex_.try_lock()) {"
+assert s.count(old) == 1, "sendMetadataSync bounded acquisition not found"
+i = s.index(old); j = s.index("    std::lock_guard<std::mutex> writeLock(sendSocketMutex_, std::adopt_lock);", i)
+assert j > i
+open(p, "w").write(s[:i] + "    // MUTANT: metadata is written with no lock and no budget\n" + s[j:]
+                   .replace("std::lock_guard<std::mutex> writeLock(sendSocketMutex_, std::adopt_lock);",
+                            "// MUTANT: nothing was acquired to adopt", 1))
+PY
+then build_and_run_channel sw-mutant-metadata-unlocked "$ROOT/qa/socket-write-order.cpp" "$MS2" fail
+fi
+
+# MS3: the deadline is back to being per-poll rather than per-write. The trickle peer keeps poll()
+# succeeding forever, so S2 — the eviction — is what dies.
+MS3=$(fresh_copy mutant-per-poll-deadline)
+if apply_mutant sw-mutant-per-poll-deadline "$MS3/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "        if (now >= deadline) {"
+assert s.count(old) == 1, "whole-write deadline not found"
+open(p, "w").write(s.replace(old, "        if (false && now >= deadline) {  // MUTANT: only poll() is bounded", 1))
+PY
+then build_and_run_channel sw-mutant-per-poll-deadline "$ROOT/qa/socket-write-order.cpp" "$MS3" fail
+fi
+
+# MS4: the write loop stops looking at running_/connected_. S2 stays green — the overall deadline is
+# still there — and S3 is what dies: the frame keeps being served to a peer that is no longer going
+# to take it, and the sender thread is only released when the transfer finishes. Proves the alive
+# check is load-bearing and is NOT covered by ~Channel()'s shutdown(SHUT_RDWR), which is why S3 marks
+# the channel dead with the peer's FIN instead of by tearing the channel down.
+MS4=$(fresh_copy mutant-no-alive-check)
+if apply_mutant sw-mutant-no-alive-check "$MS4/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "        if (!running_ || !connected_) {"
+assert s.count(old) == 1, "alive check not found"
+open(p, "w").write(s.replace(old, "        if (false) {  // MUTANT: teardown cannot interrupt the write", 1))
+PY
+then build_and_run_channel sw-mutant-no-alive-check "$ROOT/qa/socket-write-order.cpp" "$MS4" fail
+fi
+
+echo
+
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
   echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"

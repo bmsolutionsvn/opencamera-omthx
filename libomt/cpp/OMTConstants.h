@@ -22,6 +22,23 @@ namespace Constants {
     // until the kernel gives up on the peer (~11 min with only TCP_KEEPIDLE set), holding every
     // AsyncPool slot it owns so that subscriber's stream is dead meanwhile.
     constexpr int NETWORK_SEND_TIMEOUT_MS = 1000;
+    /// How often a write in progress re-checks that the channel is still alive and still inside its
+    /// deadline (P0 #7). This is the poll() slice; NETWORK_SEND_TIMEOUT_MS is the bound on the
+    /// WHOLE write. They were the same number when the timeout only bounded each poll(), which is
+    /// what let a peer that drains a few bytes every second hold a 1.5 MB frame in flight forever:
+    /// poll kept succeeding, the "timeout" kept resetting, the sender thread never returned to the
+    /// queue and the AsyncPool slot it owns never came back.
+    constexpr int NETWORK_SEND_POLL_SLICE_MS = 100;
+    /// How long sendMetadataSync waits for the per-channel socket-write lock before it gives up on
+    /// the subscriber (P0 #7). The invariant that matters: this must exceed NETWORK_SEND_TIMEOUT_MS
+    /// with room, because the async video writer holds that lock for the whole of one write — a
+    /// budget below the write's own bound declares a subscriber dead for a video frame that was
+    /// still perfectly inside its deadline (the first draft of qa/socket-write-order.cpp S1 did
+    /// exactly that at 2000 ms against a 5000 ms write). Desktop's copy uses 6000 ms against its
+    /// 5000 ms write; there the metadata writer also holds the sender-wide channelsMutex_ while it
+    /// waits, here Sender::sendMetadata snapshots the channel list and releases that lock first, so
+    /// this budget only ever delays the thread that called it.
+    constexpr int NETWORK_METADATA_LOCK_BUDGET_MS = 3000;
     constexpr int NETWORK_KEEPALIVE_IDLE_S = 5;    // first probe (matches libomtnet)
     constexpr int NETWORK_KEEPALIVE_INTVL_S = 2;   // repeat probes: unset kernel default is 75s
     constexpr int NETWORK_KEEPALIVE_CNT = 3;       // failed probes before the peer is declared gone
