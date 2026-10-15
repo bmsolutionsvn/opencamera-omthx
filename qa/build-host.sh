@@ -7,8 +7,31 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
-SCRATCH=${SCRATCH:-/tmp/omt-qa}
-mkdir -p "$SCRATCH"
+# ── Harness isolation ────────────────────────────────────────────────────────
+# Scenario binaries bind fixed ports (45331-45335) and every mutant lives under one scratch tree,
+# so two qa/build-host.sh runs in parallel shred each other's verdicts. A shared /tmp/omt-qa lets
+# run A compile while run B rm -rf's and re-copies the same mutant directory underneath it: the
+# observed wreckage was a wall of NULs inside <built-in> #define __cpp_aligned_new, an
+# OMTChannel.cpp referencing CloseReason from the OTHER checkout's tree, an OMTDiscovery.cpp that
+# "simply was not there", and "[FAIL] sender.start() on port 45334" from the other run's live
+# scenarios. None of it was the product's fault. Two rules:
+#   1. the scratch dir is unique per run (SCRATCH= still overrides, e.g. for repeat-run.sh);
+#   2. the suite holds an exclusive lock — the fixed ports are a machine-wide resource that no
+#      unique tmpdir can un-share. A second run queues behind the first instead of corrupting it.
+SCRATCH_ROOT=${SCRATCH_ROOT:-/tmp/omt-qa}
+mkdir -p "$SCRATCH_ROOT" || { echo "QA HARNESS ERROR: cannot create $SCRATCH_ROOT"; exit 2; }
+if [ -z "${SCRATCH:-}" ]; then
+  SCRATCH=$(mktemp -d "$SCRATCH_ROOT/run.XXXXXXXX") \
+    || { echo "QA HARNESS ERROR: mktemp -d under $SCRATCH_ROOT failed"; exit 2; }
+fi
+mkdir -p "$SCRATCH" || { echo "QA HARNESS ERROR: cannot create scratch dir $SCRATCH"; exit 2; }
+if command -v flock >/dev/null 2>&1; then
+  exec 9>"$SCRATCH_ROOT/.build-host.lock" \
+    || { echo "QA HARNESS ERROR: cannot open the run lock under $SCRATCH_ROOT"; exit 2; }
+  flock -w "${QA_LOCK_TIMEOUT:-3600}" 9 \
+    || { echo "QA HARNESS ERROR: another qa/build-host.sh holds the run lock after ${QA_LOCK_TIMEOUT:-3600}s — the scenarios bind fixed ports, so runs must not overlap"; exit 2; }
+fi
+echo "qa scratch: $SCRATCH"
 # Prefer the clang that ships with the NDK: vmxcodec.h uses __declspec(align(64)), which only
 # clang accepts (with -fdeclspec), and using the same compiler family as the APK build means the
 # host QA cannot drift into a build the device would never have produced.
@@ -43,6 +66,51 @@ if [ -z "${ASAN_SYMBOLIZER_PATH:-}" ]; then
 fi
 
 rc=0
+FAILED=()             # scenarios that came back red, with the reason
+HARNESS_ERR=0         # the harness could not even express a scenario — NOT a product verdict
+
+# A harness failure (missing pinned base, extraction that produced the wrong tree, a mutant anchor
+# that no longer matches) is not a product failure and must never be dressed up as one.
+harness_die() {
+  echo
+  echo "QA HARNESS ERROR: $*"
+  echo "  (harness failure — no verdict was reached; this is not a product regression)"
+  exit 2
+}
+mark_harness_err() { echo "  QA HARNESS ERROR: $*"; HARNESS_ERR=1; rc=1; }
+
+require_rev() { # <rev> <what it captures> — the pinned pre-fix bases are immutable commits; if
+                # this clone cannot see one, the harness is broken and must say so, loudly
+  git cat-file -e "$1^{commit}" 2>/dev/null \
+    || harness_die "base revision $1 ($2) is not reachable in this clone — the QA bases are pinned commits, not branch names; fetch the full history (git fetch --unshallow; git fetch origin; git fetch https://github.com/yd-zd/opencamera-omt '+refs/heads/*:refs/remotes/fork/*') and retry"
+}
+
+extract_rev_file() { # <rev> <path> <dest> — `git show ... > f` ALONE leaves an EMPTY f behind when
+                     # the rev or path is bad, and the scenario then dies in the linker looking
+                     # like a product defect; abort before that can happen
+  require_rev "$1" "source of $2"
+  git show "$1:$2" > "$3.part" 2>"$SCRATCH/git-show.err" \
+    || harness_die "git show $1:$2 failed: $(tr '\n' ' ' < "$SCRATCH/git-show.err")"
+  [ -s "$3.part" ] || harness_die "git show $1:$2 produced an empty file — refusing to build a scenario out of nothing"
+  mv "$3.part" "$3"
+}
+
+# A pre-fix copy must be VERIFIABLY pre-fix: a pin that silently points after the fix turns a
+# must-fail scenario into a must-pass lie (that is exactly how `git show master:` rotted — PR #13
+# merged, master moved under the harness, and ss-prefix started passing the gate it exists to
+# prove). Grep the copy both ways: the old shape present, the fix absent.
+must_grep()     { grep -q "$2" "$1" || harness_die "pre-fix check: $1 lacks /$2/ — the extracted copy is not the pre-fix tree this scenario claims to run"; }
+must_not_grep() { if grep -q "$2" "$1"; then harness_die "pre-fix check: $1 still contains /$2/ — the gate was never removed; scoring this copy as a caught mutant would be a lie"; fi; }
+
+apply_mutant() { # <scenario> <file> — python patch text on stdin. An anchor that no longer
+                 # matches means the gate was NEVER disabled: the copy is still the fixed code, and
+                 # scoring it as "expected fail" would blame the test for the harness's drift.
+  local name=$1 f=$2
+  if python3 - "$f"; then return 0; fi
+  mark_harness_err "$name: mutant could not be applied — the anchor is gone, so the gate was never disabled; refusing to score an unpatched copy"
+  FAILED+=("$name(anchor-missing)")
+  return 1
+}
 
 # build_and_run <binary-name> <test.cpp> <omt-source-dir> <expect pass|fail> [vmx-source-dir]
 #   <omt-source-dir> is a copy of libomt/cpp (the tree, or a mutant's).
@@ -65,20 +133,26 @@ build_and_run() {
   if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
     echo "  $name: BUILD FAILED (refusing to score an absent run)"
     sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
-    rc=1; return
+    FAILED+=("$name(build-failed)"); rc=1; return
   fi
   score_run "$name" "$expect"
 }
 
-fresh_copy() { # <dir> — an isolated tree a mutant may deface
-  local d="$SCRATCH/$1"; rm -rf "$d"; mkdir -p "$d"
-  cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$d"/
+fresh_copy() { # <dir> — an isolated tree a mutant may deface. Copies the WHOLE directory, not a
+               # *.cpp/*.h glob: a future .hpp would otherwise be silently left behind and the
+               # mutant would fail to compile for the wrong reason. Errors go to stderr because
+               # callers capture stdout — an empty return plus the apply_mutant/extract guards
+               # downstream is what turns a cp failure into a harness error, not a mystery.
+  local d="$SCRATCH/$1"; rm -rf "$d"
+  mkdir -p "$d" || { echo "QA HARNESS ERROR: cannot create mutant dir $d" >&2; return 1; }
+  cp -R "$ROOT/libomt/cpp/." "$d"/ || { echo "QA HARNESS ERROR: cannot copy libomt/cpp into $d" >&2; return 1; }
   echo "$d"
 }
 
 fresh_copy_vmx() { # <dir> — an isolated copy of the CODEC, for mutants that edit vmxcodec.cpp
-  local d="$SCRATCH/$1"; rm -rf "$d"; mkdir -p "$d"
-  cp "$ROOT"/libvmx/src/*.cpp "$ROOT"/libvmx/src/*.h "$d"/
+  local d="$SCRATCH/$1"; rm -rf "$d"
+  mkdir -p "$d" || { echo "QA HARNESS ERROR: cannot create mutant dir $d" >&2; return 1; }
+  cp -R "$ROOT/libvmx/src/." "$d"/ || { echo "QA HARNESS ERROR: cannot copy libvmx/src into $d" >&2; return 1; }
   echo "$d"
 }
 
@@ -98,7 +172,7 @@ score_run() {
   else
     echo "  $1: $got but expected $2  <-- PROBLEM"
     sed 's/^/      /' "$SCRATCH/$1.run.log" | tail -18
-    rc=1
+    FAILED+=("$1(verdict-$got)"); rc=1
   fi
 }
 
@@ -116,18 +190,33 @@ build_and_run_vmx() {
   if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
     echo "  $name: BUILD FAILED (refusing to score an absent run)"
     sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
-    rc=1; return
+    FAILED+=("$name(build-failed)"); rc=1; return
   fi
   score_run "$name" "$expect"
 }
 
 echo "== slow-subscriber: a stalled Wi-Fi viewer must not take the stream down =="
 build_and_run ss-fixed "$ROOT/qa/slow-subscriber.cpp" "$ROOT/libomt/cpp" pass
+# The pre-fix state of the slow-subscriber gate, pinned to the IMMUTABLE commit immediately before
+# the fix: df66b01f = 45b8b48e^, the commit before "a stalled subscriber can no longer hold the
+# stream hostage" (PR #13). This used to be `git show master:` — accurate only until PR #13 MERGED:
+# master moved under the harness, the extraction silently became a post-fix copy, and the
+# must-fail scenario started passing the very gate it exists to prove. master is not a pin.
+#
+# Only OMTChannel.cpp comes from the base; every header and every other .cpp stays from the tree.
+# (1) The test asserts against post-fix names — ch->staleEvicted(), Constants::NETWORK_SEND_TIMEOUT_MS
+# — that no pre-fix header declares, and a pre-fix OMTSender.cpp cannot compile against today's
+# OMTSender.h at all (addChannel/createEncoder changed signature since). (2) All TUs must agree on
+# Channel's layout: the socket-write section (added by fix/omt-socket-write-serialization) documents
+# what header mixing did to the counters (-4702111234474983746 — "not evidence of anything"). The
+# eviction and write paths under test live
+# entirely in OMTChannel.cpp; OMTAsyncPool.cpp/.h have not moved since df66b01f.
+BASE_SS=${QA_BASE:-df66b01f}
 OLD="$SCRATCH/pre-fix"; rm -rf "$OLD"; mkdir -p "$OLD"
-for f in OMTChannel.cpp OMTAsyncPool.cpp OMTSender.cpp OMTDiscovery.cpp \
-         OMTChannel.h OMTSender.h OMTDiscovery.h OMTConstants.h OMTProtocol.h OMTAsyncPool.h; do
-  git show "master:libomt/cpp/$f" > "$OLD/$f" 2>/dev/null || { echo "  cannot extract $f from master"; rc=1; }
-done
+cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$OLD"/
+extract_rev_file "$BASE_SS" "libomt/cpp/OMTChannel.cpp" "$OLD/OMTChannel.cpp"
+must_grep     "$OLD/OMTChannel.cpp" 'sendAllBlocking'
+must_not_grep "$OLD/OMTChannel.cpp" 'sendWithDeadline'
 build_and_run ss-prefix "$ROOT/qa/slow-subscriber.cpp" "$OLD" fail
 
 echo
@@ -135,24 +224,26 @@ echo "== colorspace-gate: refuse what the encoder cannot honour =="
 build_and_run cs-fixed "$ROOT/qa/colorspace-gate.cpp" "$ROOT/libomt/cpp" pass
 
 M1=$(fresh_copy mutant-gate)
-python3 - "$M1/OMTSender.cpp" <<'PY'
+if apply_mutant cs-mutant-gate "$M1/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "    if (frame.colorSpace != ColorSpace::Undefined &&"
 assert s.count(old) == 1, "gate not found to disable"
 open(p, "w").write(s.replace(old, "    if (false && frame.colorSpace != ColorSpace::Undefined &&", 1))
 PY
-build_and_run cs-mutant-gate "$ROOT/qa/colorspace-gate.cpp" "$M1" fail
+then build_and_run cs-mutant-gate "$ROOT/qa/colorspace-gate.cpp" "$M1" fail
+fi
 
 M2=$(fresh_copy mutant-count)
-python3 - "$M2/OMTSender.cpp" <<'PY'
+if apply_mutant cs-mutant-count "$M2/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "        encodeFailures_++;"
 assert s.count(old) == 1, "counter not found to disable"
 open(p, "w").write(s.replace(old, "        ; // MUTANT: the failure goes uncounted", 1))
 PY
-build_and_run cs-mutant-count "$ROOT/qa/colorspace-gate.cpp" "$M2" fail
+then build_and_run cs-mutant-count "$ROOT/qa/colorspace-gate.cpp" "$M2" fail
+fi
 
 echo
 echo "== frame-validation: refuse a frame the buffer cannot honour, before the codec reads it =="
@@ -161,42 +252,45 @@ build_and_run fv-fixed "$ROOT/qa/frame-validation.cpp" "$ROOT/libomt/cpp" pass
 # M5: the gate removed wholesale. B1 must die with an ASan heap-buffer-overflow READ in
 # VMX_NV12ToPlanar — that report, not the assertion, is the proof the crash was real.
 M5=$(fresh_copy mutant-validate-call)
-python3 - "$M5/OMTSender.cpp" <<'PY'
+if apply_mutant fv-mutant-validate-call "$M5/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "    if (!validateFrame(frame, why)) {"
 assert s.count(old) == 1, "validateFrame call not found to disable"
 open(p, "w").write(s.replace(old, "    if (false && !validateFrame(frame, why)) {", 1))
 PY
-build_and_run fv-mutant-validate-call "$ROOT/qa/frame-validation.cpp" "$M5" fail
+then build_and_run fv-mutant-validate-call "$ROOT/qa/frame-validation.cpp" "$M5" fail
+fi
 
 # M6: the gate present, but charging NV12 only for the luma plane — the exact arithmetic error that
 # let the chroma rows walk off the ImageReader allocation. Same ASan death, narrower cause.
 M6=$(fresh_copy mutant-nv12-need)
-python3 - "$M6/OMTSender.cpp" <<'PY'
+if apply_mutant fv-mutant-nv12-need "$M6/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "        need = h * s + (h / 2ull) * s;"
 assert s.count(old) == 1, "NV12 need clause not found"
 open(p, "w").write(s.replace(old, "        need = h * s;  // MUTANT: the UV plane is not charged for", 1))
 PY
-build_and_run fv-mutant-nv12-need "$ROOT/qa/frame-validation.cpp" "$M6" fail
+then build_and_run fv-mutant-nv12-need "$ROOT/qa/frame-validation.cpp" "$M6" fail
+fi
 
 # M7: P0 #16 removed — a zero/negative frame-rate numerator would be stamped into the wire header.
 M7=$(fresh_copy mutant-frameraten)
-python3 - "$M7/OMTSender.cpp" <<'PY'
+if apply_mutant fv-mutant-frameraten "$M7/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "    if (frame.frameRateN <= 0)"
 assert s.count(old) == 1, "frameRateN clause not found"
 open(p, "w").write(s.replace(old, "    if (false && frame.frameRateN <= 0)", 1))
 PY
-build_and_run fv-mutant-frameraten "$ROOT/qa/frame-validation.cpp" "$M7" fail
+then build_and_run fv-mutant-frameraten "$ROOT/qa/frame-validation.cpp" "$M7" fail
+fi
 
 # M8: the encode-buffer sizing put back the way it was: `int maxSize = width * height * 4`, which
 # wraps, plus the clamp that quietly turns the wrapped negative into the 1 MB floor.
 M8=$(fresh_copy mutant-narrow-cap)
-python3 - "$M8/OMTSender.cpp" <<'PY'
+if apply_mutant fv-mutant-narrow-cap "$M8/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = """    if (pixels >= maxPixels) return kMaxEncodeBufferBytes;
@@ -209,7 +303,8 @@ new = """    int maxSize = width * height * 4;              // MUTANT: the old s
     return static_cast<size_t>(maxSize);"""
 open(p, "w").write(s.replace(old, new, 1))
 PY
-build_and_run fv-mutant-narrow-cap "$ROOT/qa/frame-validation.cpp" "$M8" fail
+then build_and_run fv-mutant-narrow-cap "$ROOT/qa/frame-validation.cpp" "$M8" fail
+fi
 
 echo
 echo "== encoder-create-failure: what the sender says when the codec says no =="
@@ -218,21 +313,22 @@ echo "== encoder-create-failure: what the sender says when the codec says no =="
 build_and_run ec-fixed "$ROOT/qa/encoder-create-failure.cpp" "$ROOT/libomt/cpp" pass STUB
 
 M9=$(fresh_copy mutant-create-null)
-python3 - "$M9/OMTSender.cpp" <<'PY'
+if apply_mutant ec-mutant-create-null "$M9/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "    if (!vmxInstance_) {\n        why = \"VMX_Create refused \""
 assert s.count(old) == 1, "createEncoder NULL check not found"
 open(p, "w").write(s.replace("    if (!vmxInstance_) {", "    if (false) {  // MUTANT: NULL is cached like a success", 1))
 PY
-build_and_run ec-mutant-create-null "$ROOT/qa/encoder-create-failure.cpp" "$M9" fail STUB
+then build_and_run ec-mutant-create-null "$ROOT/qa/encoder-create-failure.cpp" "$M9" fail STUB
+fi
 
 echo
 echo "== drop-policy: when the ring is full, the newest frame must be the one that survives =="
 build_and_run dp-fixed "$ROOT/qa/drop-policy.cpp" "$ROOT/libomt/cpp" pass
 
 M3=$(fresh_copy mutant-keep-oldest)
-python3 - "$M3/OMTChannel.cpp" <<'PY'
+if apply_mutant dp-mutant-keep-oldest "$M3/OMTChannel.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "            if (!pendingQueue_.empty()) { stale = pendingQueue_.front(); pendingQueue_.pop(); }"
@@ -240,10 +336,11 @@ assert s.count(old) == 1, "evict-oldest not found"
 # the original policy: keep what is queued, drop the frame in hand
 open(p, "w").write(s.replace(old, "            if (false) { stale = pendingQueue_.front(); pendingQueue_.pop(); }", 1))
 PY
-build_and_run dp-mutant-keep-oldest "$ROOT/qa/drop-policy.cpp" "$M3" fail
+then build_and_run dp-mutant-keep-oldest "$ROOT/qa/drop-policy.cpp" "$M3" fail
+fi
 
 M4=$(fresh_copy mutant-blind-drops)
-python3 - "$M4/OMTSender.cpp" <<'PY'
+if apply_mutant dp-mutant-blind "$M4/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "    const int64_t delta = total - drops_baseline_.exchange(total);"
@@ -251,7 +348,8 @@ assert s.count(old) == 1, "drop window not found"
 # the state before this commit: the C entry point returned a hardcoded 0
 open(p, "w").write(s.replace(old, "    const int64_t delta = 0; (void)total;", 1))
 PY
-build_and_run dp-mutant-blind "$ROOT/qa/drop-policy.cpp" "$M4" fail
+then build_and_run dp-mutant-blind "$ROOT/qa/drop-policy.cpp" "$M4" fail
+fi
 
 echo
 echo "== vmx-saveto-contract: failure is 0, never a positive error code that reads as a frame =="
@@ -261,7 +359,7 @@ build_and_run vs-fixed "$ROOT/qa/vmx-saveto-contract.cpp" "$ROOT/libomt/cpp" pas
 # with VMX_ERR_INVALID_INSTANCE (5) and VMX_ERR_INVALID_PARAMETERS (6) again, and Sender::send() —
 # which tests `encodedLen <= 0` — puts a 5-byte payload behind a real FrameHeader on the wire.
 MV1=$(fresh_copy_vmx mutant-saveto-errcodes)
-python3 - "$MV1/vmxcodec.cpp" <<'PY'
+if apply_mutant vs-mutant-saveto-errcodes "$MV1/vmxcodec.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "\tif (!instance) return 0;\n\tif (!dst) return 0;\n\tif (maxLen <= 0) return 0;\n"
@@ -271,32 +369,35 @@ new = ("\tif (!instance) return VMX_ERR_INVALID_INSTANCE;\n"
        "\tif (!maxLen) return VMX_ERR_INVALID_PARAMETERS;\n")
 open(p, "w").write(s.replace(old, new, 1))
 PY
-build_and_run_vmx vs-mutant-saveto-errcodes "$ROOT/qa/vmx-saveto-contract.cpp" "$ROOT/libomt/cpp" "$MV1" fail
+then build_and_run_vmx vs-mutant-saveto-errcodes "$ROOT/qa/vmx-saveto-contract.cpp" "$ROOT/libomt/cpp" "$MV1" fail
+fi
 
 # MV2: CHECKBUFF_SAVE back to the out-of-range pointer comparison. The negative-length probes in
 # part C then pass the bounds check and hand memcpy (size_t)(-8) and (size_t)(-4): ASan, not an
 # assertion. Both loops are probed because the macro is written out twice in VMX_SaveTo.
 MV2=$(fresh_copy_vmx mutant-checkbuff)
-python3 - "$MV2/vmxcodec.cpp" <<'PY'
+if apply_mutant vs-mutant-checkbuff "$MV2/vmxcodec.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "\tif (_need < 4 || _need > _remaining) return 0; \\\n"
 assert s.count(old) == 1, "CHECKBUFF_SAVE remaining-bytes check not found"
 open(p, "w").write(s.replace(old, "\tif ((b + checkNumBytes) > maxB) return 0; \\\n", 1))
 PY
-build_and_run_vmx vs-mutant-checkbuff "$ROOT/qa/vmx-saveto-contract.cpp" "$ROOT/libomt/cpp" "$MV2" fail
+then build_and_run_vmx vs-mutant-checkbuff "$ROOT/qa/vmx-saveto-contract.cpp" "$ROOT/libomt/cpp" "$MV2" fail
+fi
 
 # MV4: the sender's own length gate disabled at the predicate. The codec bounds itself, so this is
 # the belt being tested on its own — which is only possible because the predicate is pure.
 MV4=$(fresh_copy mutant-saveto-predicate)
-python3 - "$MV4/OMTSender.cpp" <<'PY'
+if apply_mutant vs-mutant-predicate "$MV4/OMTSender.cpp" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "    return encodedLen > 0 && static_cast<size_t>(encodedLen) <= capacity;"
 assert s.count(old) == 1, "encodedLenAcceptable predicate not found"
 open(p, "w").write(s.replace(old, "    return true;  // MUTANT: any length the codec returns is publishable", 1))
 PY
-build_and_run vs-mutant-predicate "$ROOT/qa/vmx-saveto-contract.cpp" "$MV4" fail
+then build_and_run vs-mutant-predicate "$ROOT/qa/vmx-saveto-contract.cpp" "$MV4" fail
+fi
 
 echo
 echo "== aligned-stride: the codec may only touch the buffer it actually owns =="
@@ -313,7 +414,7 @@ build_and_run_codec() { # <name> <test.cpp> <vmx-src-dir> <expect pass|fail>
   if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
     echo "  $name: BUILD FAILED (refusing to score an absent run)"
     sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
-    rc=1; return
+    FAILED+=("$name(build-failed)"); rc=1; return
   fi
   score_run "$name" "$expect"
 }
@@ -323,53 +424,68 @@ build_and_run_codec as-fixed "$ROOT/qa/aligned-stride.cpp" "$ROOT/libvmx/src" pa
 # The fix removed wholesale: the three files it touches, taken from the commit this branch sits on.
 # The predicate revert cannot be done in-place in the header alone — VMX_FreeAlignedStrideBuffer
 # changed signature, so its callers have to revert with it or the mutant just fails to build.
-BASE_A=${QA_BASE:-fix/omt-input-validation-off-the-desktop}
+# Pinned to d2ab8ca8 — the commit the aligned-stride fix (cc4a57a9, PR #20) sat on, i.e. the old
+# tip of fix/omt-input-validation-off-the-desktop. A branch NAME was deletable and absent from
+# fresh clones; this sha is an ancestor of master, so it is always reachable. QA_BASE overrides for
+# A/B experiments — it must name a commit, not a moving ref.
+BASE_A=${QA_BASE:-d2ab8ca8}
 PFV="$SCRATCH/vmx-prefix-aligned"; rm -rf "$PFV"; mkdir -p "$PFV"
 cp "$ROOT"/libvmx/src/*.cpp "$ROOT"/libvmx/src/*.h "$PFV"/
 for f in vmxcodec_common.h vmxcodec_x86.cpp vmxcodec_arm.cpp; do
-  git show "$BASE_A:libvmx/src/$f" > "$PFV/$f" 2>/dev/null || { echo "  cannot extract $f from $BASE_A"; rc=1; }
+  extract_rev_file "$BASE_A" "libvmx/src/$f" "$PFV/$f"
 done
-grep -q 'alignedStride != srcStride' "$PFV/vmxcodec_common.h" \
-  || { echo "  the pre-fix copy does not look pre-fix — extraction failed"; rc=1; }
+must_grep "$PFV/vmxcodec_common.h" 'alignedStride != srcStride'
 build_and_run_codec as-prefix "$ROOT/qa/aligned-stride.cpp" "$PFV" fail
 
 # MA1: ownership predicate back to stride inequality in the copy only — the encoder reads the
 # uninitialised malloc for a stride-padded HAL frame, and the bitstream depends on heap history.
 MA1=$(fresh_copy_vmx mutant-copy-predicate)
-python3 - "$MA1/vmxcodec_common.h" <<'PY'
+if apply_mutant as-mutant-copy-predicate "$MA1/vmxcodec_common.h" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "\tif (aligned != srcBuffer)"
 assert s.count(old) == 1, "CopyTo ownership predicate not found"
 open(p, "w").write(s.replace(old, "\tif (alignedStride != srcStride)  // MUTANT: the old predicate", 1))
 PY
-build_and_run_codec as-mutant-copy-predicate "$ROOT/qa/aligned-stride.cpp" "$MA1" fail
+then build_and_run_codec as-mutant-copy-predicate "$ROOT/qa/aligned-stride.cpp" "$MA1" fail
+fi
 
 # MA2: ownership fixed but the row tail left uninitialised — the vector loads read indeterminate
 # bytes and the last block of every row is non-deterministic.
 MA2=$(fresh_copy_vmx mutant-no-tail-memset)
-python3 - "$MA2/vmxcodec_common.h" <<'PY'
+if apply_mutant as-mutant-no-tail-memset "$MA2/vmxcodec_common.h" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "\t\t\tif (alignedStride > rowBytes)\n\t\t\t\tmemset(pDst + rowBytes, 0, (size_t)(alignedStride - rowBytes));\n"
 assert s.count(old) == 1, "tail memset not found"
 open(p, "w").write(s.replace(old, "\t\t\t// MUTANT: the tail stays exactly as malloc left it\n", 1))
 PY
-build_and_run_codec as-mutant-no-tail-memset "$ROOT/qa/aligned-stride.cpp" "$MA2" fail
+then build_and_run_codec as-mutant-no-tail-memset "$ROOT/qa/aligned-stride.cpp" "$MA2" fail
+fi
 
 # MA3: free() unconditionally — the other direction. A width that is already aligned borrows the
 # caller's buffer; freeing it is an ASan death ("not malloc()-ed"), which is why the ownership
 # predicate has to be identity and not "always".
 MA3=$(fresh_copy_vmx mutant-free-always)
-python3 - "$MA3/vmxcodec_common.h" <<'PY'
+if apply_mutant as-mutant-free-always "$MA3/vmxcodec_common.h" <<'PY'
 import sys
 p = sys.argv[1]; s = open(p).read()
 old = "\tif (aligned != original)\n\t{\n\t\tfree(aligned);\n\t}"
 assert s.count(old) == 1, "Free ownership predicate not found"
 open(p, "w").write(s.replace(old, "\tif (true)  // MUTANT: ownership ignored\n\t{\n\t\tfree(aligned);\n\t}", 1))
 PY
-build_and_run_codec as-mutant-free-always "$ROOT/qa/aligned-stride.cpp" "$MA3" fail
+then build_and_run_codec as-mutant-free-always "$ROOT/qa/aligned-stride.cpp" "$MA3" fail
+fi
 
 echo
-if [ $rc -ne 0 ]; then echo "QA FAILED"; exit 1; fi
+if [ "$HARNESS_ERR" -ne 0 ]; then
+  echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"
+  [ ${#FAILED[@]} -gt 0 ] && echo "  failing scenarios: ${FAILED[*]}"
+  exit 2
+fi
+if [ $rc -ne 0 ]; then
+  echo "QA FAILED"
+  [ ${#FAILED[@]} -gt 0 ] && echo "  red scenarios: ${FAILED[*]}"
+  exit 1
+fi
 echo "QA PASSED (every gate has a scenario where disabling it turns the suite red)"
