@@ -54,7 +54,7 @@ struct ChannelStats {
  */
 enum class CloseReason : uint8_t {
     None = 0,
-    PeerClosed,          ///< recv() returned 0: the peer closed its write half
+    PeerClosed,          ///< recv() failed with an errno the kernel uses to name a dead peer
     RecvError,           ///< recv() failed with something other than EAGAIN
     PollError,           ///< poll() failed with something other than EINTR
     SendFailed,          ///< a write could not be completed inside its deadline
@@ -122,6 +122,12 @@ public:
     int64_t framesSent() const { return framesSent_.load(); }
     int64_t staleEvicted() const { return staleEvicted_.load(); }
     int64_t tornSends() const { return tornSends_.load(); }
+    /// Test seam for the once-per-stall-episode rule (qa/receiver-peer-lifetime.cpp): the host
+    /// build compiles the LOG macros away, so "did it warn once per episode, and does it warn again
+    /// after a read that delivered" is only observable as state. Counted, not latched-and-sampled —
+    /// the successful read that re-arms the latch lands microseconds after the first, so a test that
+    /// sampled the flag would be racing its own assertion.
+    int64_t readTransientWarningsForTest() const { return readTransientWarnings_.load(); }
     void disconnect();
 
     /// Why this channel stopped carrying traffic. `None` until something names it.
@@ -211,6 +217,16 @@ private:
     std::atomic<int64_t> staleEvicted_{0};
     /// Writes that began and failed partway — a distinct failure mode from a clean drop.
     std::atomic<int64_t> tornSends_{0};
+    /// Guards the receiverLoop's transient-read warning so it prints ONCE per stall episode instead
+    /// of once per attempt. Re-armed by the next read that returns bytes. The desktop copy shipped
+    /// without this for one release and printed 802 identical warnings in three minutes against a
+    /// single slow OBS viewer; a warning that fires on every retry is not a diagnostic, it is the
+    /// outage printed out. Per-channel on purpose — the earlier `static bool` form raced across
+    /// channels, so the second viewer in a room was never reported at all.
+    std::atomic<bool> warnedReadTransient_{false};
+    /// How many times that warning actually fired. Monotonic, so a test can count the lines the
+    /// operator would see instead of racing to sample the latch before the next read clears it.
+    std::atomic<int64_t> readTransientWarnings_{0};
     std::atomic<int64_t> bytesSent_{0};
     std::atomic<int64_t> bytesReceived_{0};
     /// CloseReason as a raw byte so it can be published from any thread without a lock; the
