@@ -149,7 +149,10 @@ Java_net_sourceforge_opencamera_OMTSender_nativeSendFrame(
         LOGD("Frame sent (result: %d)", result);
     }
     
-    return JNI_TRUE;
+    // Was: return JNI_TRUE unconditionally, so OMTSender.sendFrame()'s boolean could not
+    // distinguish "a receiver got this" from "the codec refused it". omt_send returns 1 when
+    // there are simply no subscribers, which is not a failure, so the test is > 0, not != 0.
+    return result > 0 ? JNI_TRUE : JNI_FALSE;
 }
 
 /**

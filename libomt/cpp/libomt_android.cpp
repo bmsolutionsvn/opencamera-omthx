@@ -300,9 +300,9 @@ void omt_send_set_quality(omt_send_t* instance, OMTQuality quality) {
 }
 
 int64_t omt_send_get_recent_drops_and_reset(omt_send_t* instance) {
-    // Not implemented in new modular design - would need to track in Sender
-    // For now, return 0 (no recent drops tracked)
-    return 0;
+    if (!instance) return 0;
+    omt::Sender* sender = reinterpret_cast<omt::Sender*>(instance);
+    return sender->getRecentDropsAndReset();
 }
 
 } // extern "C"

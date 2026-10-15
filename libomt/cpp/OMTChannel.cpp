@@ -196,10 +196,29 @@ int Channel::sendAsync(const void* headerData, size_t headerLen,
     
     AsyncBuffer* buf = sendPool_->acquire();
     if (!buf) {
+        // Was: drop THIS frame and keep whatever is queued. With 4 slots and a subscriber that
+        // stalled for a moment, the queue fills with the oldest frames; when the window reopens
+        // the senderLoop replays up to 4 already-decoded frames (133 ms at 30fps) before anything
+        // live reaches the screen — the stall shows up as latency instead of as a few dropped
+        // frames. For a live stream the newest frame is the only one worth sending, so evict the
+        // oldest queued buffer, hand its slot to this frame, and count the eviction.
+        AsyncBuffer* stale = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (!pendingQueue_.empty()) { stale = pendingQueue_.front(); pendingQueue_.pop(); }
+        }
+        if (stale) {
+            sendPool_->release(stale);
+            staleEvicted_++;
+            framesDropped_++;
+            buf = sendPool_->acquire();
+        }
+    }
+    if (!buf) {
         framesDropped_++;
         static int dropLog = 0;
         if (dropLog++ % 30 == 0) {
-            LOGD("sendAsync: pool exhausted (dropped: %lld)", 
+            LOGD("sendAsync: pool exhausted (dropped: %lld)",
                  (long long)framesDropped_.load());
         }
         return 0;
@@ -250,6 +269,12 @@ void Channel::senderLoop() {
         if (success) {
             framesSent_++;
             bytesSent_ += buf->length;
+        } else {
+            // Neither counted before: the frame left the queue, wrote some bytes, and appeared in
+            // no counter at all — so framesSent + framesDropped did not add up to frames offered,
+            // and the adaptive-quality logic under-reacted exactly when the link was failing.
+            framesDropped_++;
+            tornSends_++;
         }
         
         sendPool_->release(buf);
