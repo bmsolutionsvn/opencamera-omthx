@@ -19,6 +19,7 @@
 #include <memory>
 #include <string>
 #include <functional>
+#include <cstddef>
 
 #include "OMTConstants.h"
 #include "OMTChannel.h"
@@ -116,14 +117,19 @@ public:
     /// were counted nowhere.
     long long encodeFailures() const { return encodeFailures_.load(); }
 
-    // Test seams for the host QA suite (qa/frame-validation.cpp). Both gates are static, pure and
-    // side-effect-free, so the suite can assert each clause on its own instead of inferring it
-    // from socket timing. No production path calls them.
+    // Test seams for the host QA suite. Each of these gates is static, pure and side-effect-free,
+    // so the suite can assert a clause on its own instead of inferring it from socket timing. No
+    // production path calls them.
     static bool validateFrameForTest(const MediaFrame& frame, std::string& why) {
         return validateFrame(frame, why);
     }
     static size_t encodeBufferCapacityForTest(int width, int height) {
         return encodeBufferCapacity(width, height);
+    }
+    // qa/vmx-saveto-contract.cpp: the codec bounds its own output length, so the only way to watch
+    // this belt is to assert the predicate directly.
+    static bool encodedLenAcceptableForTest(int encodedLen, size_t capacity) {
+        return encodedLenAcceptable(encodedLen, capacity);
     }
     /// Drops across all subscribers since the previous call (per-second congestion view).
     int64_t getRecentDropsAndReset();
@@ -241,6 +247,8 @@ private:
     // (P0 #9 / P0 #16, from the desktop vendored sender.)
     static bool validateFrame(const MediaFrame& frame, std::string& why);
     static size_t encodeBufferCapacity(int width, int height);
+    // P0 #10: what VMX_SaveTo() is allowed to hand back for it to be published as a frame at all.
+    static bool encodedLenAcceptable(int encodedLen, size_t capacity);
     
     // Buffer size calculation
     static int calculateOptimalBuffer(int width, int height, int profile);
