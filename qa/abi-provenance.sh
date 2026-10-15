@@ -104,5 +104,5 @@ if [ -n "$EXPECT_SRC" ]; then
   [ "$SRC" = "$EXPECT_SRC" ] || fail "stamp says omt-src-sha256=$SRC, the checkout hashes to $EXPECT_SRC — the stamp was edited or the lib is stale"
 fi
 
-echo "PROVEN: $(echo "$REQUIRED" | wc -l) ABIs, $(echo "$ALL_STAMPS" | grep -c .) stamped libs, git=$REV dirty=$DIRTY omt-src-sha256=$SRC"
+echo "PROVEN: ${#REQUIRED[@]} ABIs, $(echo "$ALL_STAMPS" | grep -c .) stamped libs, git=$REV dirty=$DIRTY omt-src-sha256=$SRC"
 exit 0
