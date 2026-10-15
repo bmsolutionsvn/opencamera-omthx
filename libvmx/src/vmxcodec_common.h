@@ -632,6 +632,12 @@ if (termsToDecode > 0 && termsToDecode < 64) { \
 }
 
 
+// Build marker for QA (skill opencamera-omt-android, rule 4: "verify the native lib was really
+// rebuilt"). `strings libvmx.so | grep vmx-aligned-stride-ownership` is how the APK build proves
+// the NDK compiled this header into the shipped library rather than reusing a stale object.
+// __attribute__((used)) stops the optimiser discarding an otherwise unreferenced literal.
+__attribute__((used)) static const char VMX_AlignedStrideBuildTag[] = "vmx-aligned-stride-ownership-p0-12";
+
 inline void VMX_CreateAlignedStrideBuffer(BYTE* src, int srcStride, VMX_SIZE srcSize, BYTE** aligned, int* alignedStride, int alignment, int bytesPerPixel)
 {
 	int w = srcSize.width;
@@ -646,9 +652,19 @@ inline void VMX_CreateAlignedStrideBuffer(BYTE* src, int srcStride, VMX_SIZE src
 	*aligned = p;
 	*alignedStride = s;
 }
+// Ownership predicate (P0 #12, ported from the desktop vendored copy).
+// VMX_CreateAlignedStrideBuffer below mallocs iff (width % alignment) — the row stride is NOT
+// part of that decision. The three helpers that follow used to decide by (alignedStride !=
+// srcStride) instead, and the two predicates disagree whenever a HAL already pads its row stride
+// up to the alignment while the width is not a multiple of it (1080 and 2592 are real camera
+// widths that do exactly this): the malloc happened, yet every predicate says "not ours". The
+// encoder then runs over the UNINITIALIZED malloc'd buffer — a black or garbage frame with no
+// error anywhere — and the buffer leaks on every call. Gate on pointer identity against the
+// original buffer, i.e. on whether Create actually handed us something new.
 inline void VMX_CopyFromAlignedStrideBufferAndFree(BYTE* aligned, int alignedStride, BYTE* dstBuffer, int dstStride, VMX_SIZE dstSize, int bytesPerPixel)
 {
-	if (alignedStride != dstStride)
+	// Own the buffer iff Create malloc'd it (aligned != the caller's dst pointer).
+	if (aligned != dstBuffer)
 	{
 		BYTE* pSrc = aligned;
 		for (int y = 0; y < dstSize.height; y++)
@@ -660,21 +676,35 @@ inline void VMX_CopyFromAlignedStrideBufferAndFree(BYTE* aligned, int alignedStr
 		free(aligned);
 	}
 }
-inline void VMX_FreeAlignedStrideBuffer(BYTE* aligned, int alignedStride, int srcStride)
+inline void VMX_FreeAlignedStrideBuffer(BYTE* aligned, int alignedStride, const BYTE* original)
 {
-	if (alignedStride != srcStride)
+	// Free iff we own it: Create malloc'd it, so aligned != the original src pointer.
+	(void)alignedStride;
+	if (aligned != original)
 	{
 		free(aligned);
 	}
 }
 inline void VMX_CopyToAlignedStrideBuffer(BYTE* aligned, int alignedStride, BYTE* srcBuffer, int srcStride, VMX_SIZE srcSize, int bytesPerPixel)
 {
-	if (alignedStride != srcStride)
+	// Copy iff we own the buffer (Create malloc'd it), detected by pointer identity against the
+	// original — NOT by stride inequality, which is inconsistent with Create's allocation
+	// predicate (w % alignment) and silently skips the copy for a stride-padded HAL frame.
+	if (aligned != srcBuffer)
 	{
 		BYTE* pDst = aligned;
+		const int rowBytes = srcSize.width * bytesPerPixel;
 		for (int y = 0; y < srcSize.height; y++)
 		{
-			memcpy(pDst, srcBuffer, srcSize.width * bytesPerPixel);
+			memcpy(pDst, srcBuffer, rowBytes);
+			// P0 #12: initialise the row tail that the SIMD block loader reads past the valid
+			// pixels. Create allocated each row at alignedStride (>= rowBytes) and malloc leaves
+			// that tail uninitialised, so the 32/64-byte vector loads consume indeterminate
+			// bytes and the last block of every row encodes non-deterministically. Zero it.
+			// This inline is shared by the x86 (SSE2/AVX2) and the ARM NEON path, and the ARM
+			// NEON path is what app/src/main/cpp/CMakeLists.txt builds for the APK.
+			if (alignedStride > rowBytes)
+				memset(pDst + rowBytes, 0, (size_t)(alignedStride - rowBytes));
 			srcBuffer += srcStride;
 			pDst += alignedStride;
 		}

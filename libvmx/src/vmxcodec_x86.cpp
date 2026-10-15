@@ -1940,7 +1940,7 @@ void VMX_YUY2ToPlanar(BYTE* src, int srcStride, BYTE* ydst, int ystride, BYTE* u
 		pU = udst;
 		pV = vdst;
 	}
-	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, srcStride);
+	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, src);
 }
 
 
@@ -2015,7 +2015,7 @@ void VMX_UYVYToPlanar(BYTE* src, int srcStride, BYTE* ydst, int ystride, BYTE* u
 		pU = udst;
 		pV = vdst;
 	}
-	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, srcStride);
+	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, src);
 }
 
 
@@ -2033,6 +2033,9 @@ void VMX_P216ToPlanar(BYTE* srcY, int srcStrideY, BYTE* srcUV, int srcStrideUV, 
 	int alignedStride;
 	VMX_CreateAlignedStrideBuffer(srcUV, srcStrideUV, size, &alignedSrc, &alignedStride, 32, 2);
 	VMX_CopyToAlignedStrideBuffer(alignedSrc, alignedStride, srcUV, srcStrideUV, size, 2);
+	// The UV loop below advances srcUV itself, so the ownership check has to be
+	// made against the pointer Create was given, captured here while it is still live.
+	BYTE* const srcUVOrig = srcUV;
 
 	BYTE* pSrc = alignedSrc;
 	BYTE* pU = udst;
@@ -2069,7 +2072,7 @@ void VMX_P216ToPlanar(BYTE* srcY, int srcStrideY, BYTE* srcUV, int srcStrideUV, 
 		pU = udst;
 		pV = vdst;
 	}
-	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, srcStrideUV);
+	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, srcUVOrig);
 }
 
 
@@ -2224,7 +2227,7 @@ void VMX_NV12ToPlanar(BYTE* srcY, int srcStrideY, BYTE* srcUV, int srcStrideUV, 
 		pV = vdst;
 	}
 
-	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, srcStrideUV);
+	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, srcUV);
 }
 
 
@@ -3549,7 +3552,7 @@ void VMX_BGRAToYUV4224(BYTE* pSrc, int srcStride, BYTE* pDstY, int iStrideY, BYT
 		pV = pDstV;
 		pA = pDstA;
 	}
-	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, srcStride);
+	VMX_FreeAlignedStrideBuffer(alignedSrc, alignedStride, pSrc);
 }
 
 void VMX_YUV4224ToBGRA(BYTE* pSrcY, int iStrideY, BYTE* pSrcU, int iStrideU, BYTE* pSrcV, int iStrideV, BYTE* pSrcA, int iStrideA, BYTE* pDst, int dstStride, VMX_SIZE sz, const short* colorTable)

@@ -299,5 +299,77 @@ PY
 build_and_run vs-mutant-predicate "$ROOT/qa/vmx-saveto-contract.cpp" "$MV4" fail
 
 echo
+echo "== aligned-stride: the codec may only touch the buffer it actually owns =="
+# The codec-only harness: the scenario links the codec straight from a copy of libvmx/src, and the
+# -I order puts that copy's HEADERS ahead of the tree's, so a mutant that edits
+# vmxcodec_common.h — where the aligned-stride helpers live — is really what gets compiled.
+build_and_run_codec() { # <name> <test.cpp> <vmx-src-dir> <expect pass|fail>
+  local name=$1 test=$2 vmxdir=$3 expect=$4
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS -I"$vmxdir" $INC "$test" \
+       "$vmxdir/vmxcodec.cpp" "$vmxdir/vmxcodec_x86.cpp" "$vmxdir/vmxcodec_avx2.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -10
+    rc=1; return
+  fi
+  score_run "$name" "$expect"
+}
+
+build_and_run_codec as-fixed "$ROOT/qa/aligned-stride.cpp" "$ROOT/libvmx/src" pass
+
+# The fix removed wholesale: the three files it touches, taken from the commit this branch sits on.
+# The predicate revert cannot be done in-place in the header alone — VMX_FreeAlignedStrideBuffer
+# changed signature, so its callers have to revert with it or the mutant just fails to build.
+BASE_A=${QA_BASE:-fix/omt-input-validation-off-the-desktop}
+PFV="$SCRATCH/vmx-prefix-aligned"; rm -rf "$PFV"; mkdir -p "$PFV"
+cp "$ROOT"/libvmx/src/*.cpp "$ROOT"/libvmx/src/*.h "$PFV"/
+for f in vmxcodec_common.h vmxcodec_x86.cpp vmxcodec_arm.cpp; do
+  git show "$BASE_A:libvmx/src/$f" > "$PFV/$f" 2>/dev/null || { echo "  cannot extract $f from $BASE_A"; rc=1; }
+done
+grep -q 'alignedStride != srcStride' "$PFV/vmxcodec_common.h" \
+  || { echo "  the pre-fix copy does not look pre-fix — extraction failed"; rc=1; }
+build_and_run_codec as-prefix "$ROOT/qa/aligned-stride.cpp" "$PFV" fail
+
+# MA1: ownership predicate back to stride inequality in the copy only — the encoder reads the
+# uninitialised malloc for a stride-padded HAL frame, and the bitstream depends on heap history.
+MA1=$(fresh_copy_vmx mutant-copy-predicate)
+python3 - "$MA1/vmxcodec_common.h" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\tif (aligned != srcBuffer)"
+assert s.count(old) == 1, "CopyTo ownership predicate not found"
+open(p, "w").write(s.replace(old, "\tif (alignedStride != srcStride)  // MUTANT: the old predicate", 1))
+PY
+build_and_run_codec as-mutant-copy-predicate "$ROOT/qa/aligned-stride.cpp" "$MA1" fail
+
+# MA2: ownership fixed but the row tail left uninitialised — the vector loads read indeterminate
+# bytes and the last block of every row is non-deterministic.
+MA2=$(fresh_copy_vmx mutant-no-tail-memset)
+python3 - "$MA2/vmxcodec_common.h" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\t\t\tif (alignedStride > rowBytes)\n\t\t\t\tmemset(pDst + rowBytes, 0, (size_t)(alignedStride - rowBytes));\n"
+assert s.count(old) == 1, "tail memset not found"
+open(p, "w").write(s.replace(old, "\t\t\t// MUTANT: the tail stays exactly as malloc left it\n", 1))
+PY
+build_and_run_codec as-mutant-no-tail-memset "$ROOT/qa/aligned-stride.cpp" "$MA2" fail
+
+# MA3: free() unconditionally — the other direction. A width that is already aligned borrows the
+# caller's buffer; freeing it is an ASan death ("not malloc()-ed"), which is why the ownership
+# predicate has to be identity and not "always".
+MA3=$(fresh_copy_vmx mutant-free-always)
+python3 - "$MA3/vmxcodec_common.h" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "\tif (aligned != original)\n\t{\n\t\tfree(aligned);\n\t}"
+assert s.count(old) == 1, "Free ownership predicate not found"
+open(p, "w").write(s.replace(old, "\tif (true)  // MUTANT: ownership ignored\n\t{\n\t\tfree(aligned);\n\t}", 1))
+PY
+build_and_run_codec as-mutant-free-always "$ROOT/qa/aligned-stride.cpp" "$MA3" fail
+
+echo
 if [ $rc -ne 0 ]; then echo "QA FAILED"; exit 1; fi
 echo "QA PASSED (every gate has a scenario where disabling it turns the suite red)"
