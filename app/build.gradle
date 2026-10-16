@@ -1,22 +1,32 @@
 apply plugin: 'com.android.application'
 
 android {
-    compileSdk 35
+    // Google Play requires targetSdk 36 for updates since 2026-08-31; the last published release
+    // (v1.55.0-omt.3) is targetSdk 35, so no update could be shipped to existing installs until
+    // this line moved. compileSdk has to come with it — AGP will not let you compile against less
+    // than you target.
+    compileSdk 36
     compileOptions.encoding = 'UTF-8'
 
     defaultConfig {
         applicationId "io.github.ysdede.opencameraomt"
         minSdkVersion 21
-        targetSdkVersion 35
+        targetSdkVersion 36
         //compileSdkVersion 31 // needed to support appcompat:1.4.0 (which we need for emoji policy support, and not yet ready to target SDK 30)
 
         testApplicationId "net.sourceforge.opencamera.test"
         //testInstrumentationRunner "android.test.InstrumentationTestRunner"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
         
-        // OMT: Only build for arm64-v8a (our native libs are pre-built for this ABI)
+        // OMT: two ABIs, both built from source by app/src/main/cpp/CMakeLists.txt.
+        // arm64-v8a binds the NEON codec (vmxcodec_arm.cpp + -DARM64); x86_64 binds the SSE/AVX2
+        // codec (vmxcodec_x86.cpp + vmxcodec_avx2.cpp). Before 2026-10-15 this was arm64-only, which
+        // forced the x86_64 emulator to run the ARM lib under libndk_translation and hid every
+        // native-code problem behind that penalty.
+        // NOTE: there are no prebuilt .so files in this repo (removed in 367b2be7) — an ABI listed
+        // here that CMakeLists.txt does not know how to bind fails the configure step, by design.
         ndk {
-            abiFilters 'arm64-v8a'
+            abiFilters 'arm64-v8a', 'x86_64'
         }
     }
 
@@ -41,8 +51,13 @@ android {
     buildTypes {
         release {
             minifyEnabled false
-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.txt'
-            signingConfig signingConfigs.release
+            // AGP 9 refuses getDefaultProguardFile('proguard-android.txt') outright: that file
+            // carries -dontoptimize, which silently neuters R8's optimiser for anyone who later
+            // flips minifyEnabled on. This build has minifyEnabled false, so R8 never runs and the
+            // choice of default file changes nothing about the APK produced today — it only sets
+            // the floor for whoever turns minification on next.
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.txt'
+            signingConfig = signingConfigs.release
         }
     }
 
@@ -52,10 +67,10 @@ android {
     useLibrary 'android.test.runner'
     useLibrary 'android.test.base'
     lint {
-        abortOnError false
-        checkReleaseBuilds false
+        abortOnError = false
+        checkReleaseBuilds = false
     }
-    namespace 'net.sourceforge.opencamera'
+    namespace = 'net.sourceforge.opencamera'
     buildFeatures {
     }
     
@@ -63,24 +78,12 @@ android {
     externalNativeBuild {
         cmake {
             path "src/main/cpp/CMakeLists.txt"
-            version "3.22.1"
+            version = "3.22.1"
         }
     }
     
-    ndkVersion "27.0.12077973"
+    ndkVersion = "27.0.12077973"
     //useLibrary 'android.test.mock'
-
-    // Custom APK naming
-    applicationVariants.all { variant ->
-        variant.outputs.all {
-            def buildType = variant.buildType.name
-            if (buildType == "release") {
-                outputFileName = "OpenCameraOMT.apk"
-            } else {
-                outputFileName = "OpenCameraOMT-${buildType}.apk"
-            }
-        }
-    }
 }
 
 dependencies {
@@ -109,5 +112,54 @@ dependencies {
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+// Custom APK naming.
+//
+// This was `applicationVariants.all { variant -> variant.outputs.all { outputFileName = ... } }`.
+// AGP 9 removed the old Variant API, and the androidComponents replacement exposes VariantOutput
+// WITHOUT a writable outputFileName — setting it now throws "Cannot set readonly property:
+// outputFileName" (issuetracker.google.com/issues/480062612 is still open, so there is no supported
+// in-DSL rename left). What remains is to publish the finished APK under the expected name after
+// assemble, which is what this does.
+//
+// The names produced are identical to before: OpenCameraOMT.apk for release,
+// OpenCameraOMT-<buildType>.apk otherwise — deploy.ps1 and /home/reality/bin/omt-emulator-test.sh
+// look those up. Two differences worth stating:
+//   * the canonical AGP output (app-<variant>.apk) now stays in the directory alongside it, where
+//     the old DSL replaced the name outright; and
+//   * it is a finalizer of assemble, so anything that consumes the named file must go through
+//     assemble, exactly as before.
+// The task refuses to guess when the directory holds more than one candidate APK rather than
+// picking one — a wrong-name leftover must not be able to be published as the real build.
+def omtApkNameFor = { buildType -> buildType == "release" ? "OpenCameraOMT.apk" : "OpenCameraOMT-${buildType}.apk" }
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        def variantName = variant.name
+        def desired = omtApkNameFor(variant.buildType)
+        def outDir = layout.buildDirectory.dir("outputs/apk/${variantName}")
+        def publish = tasks.register("publish${variantName.capitalize()}OmtApk") {
+            description = "Publishes the ${variantName} APK as ${desired} (the AGP 9 replacement for outputFileName)."
+            // Deliberately NO declared outputs: an output declaration lets Gradle mark this
+            // UP-TO-DATE and skip the copy, which is precisely how a stale OpenCameraOMT-debug.apk
+            // could sit next to a fresh build and get shipped. With no outputs it re-copies on
+            // every assemble, and the named file can never be older than the APK it was copied from.
+            doLast {
+                def candidates = fileTree(outDir).matching { include "*.apk" }.files.findAll { it.name != desired }
+                if (candidates.size() != 1) {
+                    throw new GradleException("expected exactly one APK in ${outDir.get()}, found: " +
+                            candidates.collect { it.name }.join(", ") + " — refusing to guess which one is the build")
+                }
+                def target = new File(outDir.get().asFile, desired)
+                java.nio.file.Files.copy(candidates[0].toPath(), target.toPath(),
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING)
+                logger.lifecycle("OMT: published ${candidates[0].name} -> ${target.name} (${target.length()} bytes)")
+            }
+        }
+        // tasks.matching{} is lazy: onVariants runs during configuration, before AGP has created
+        // the assemble task, so tasks.named("assembleDebug") here fails with "Task with name
+        // 'assembleDebug' not found".
+        tasks.matching { it.name == "assemble${variantName.capitalize()}" }.configureEach { finalizedBy(publish) }
     }
 }

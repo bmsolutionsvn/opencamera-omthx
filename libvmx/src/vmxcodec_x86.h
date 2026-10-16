@@ -31,12 +31,37 @@
 #if defined(__GNUC__)
 #define __lzcnt(t) __builtin_clz(t)
 #endif
+
 #if defined(__linux__) | defined(__APPLE__)
 #include <x86intrin.h>
 #define VMX_BUFFERSWAP(t) __builtin_bswap64(t)
 #else
 #include <intrin.h>
 #define VMX_BUFFERSWAP(t) _byteswap_uint64(t)
+#endif
+
+// LZCNT and TZCNT are not baseline x86-64: clang only permits them with -mlzcnt / -mbmi
+// (x86-64-v3 territory). The Android x86_64 build compiles this path at SSE4.1 so the library loads
+// on any x86_64 CPU, while the desktop host QA compiles it with -march=haswell where the hardware
+// instructions are present. Rather than raise the shipped floor to the host's ISA, spell the two
+// operations with their exact semantics when the target does not advertise them — the same portable
+// form vmxcodec_arm.h already uses for the shipping arm64 build.
+//
+// The `? : 64` is not decoration: LZCNT(0) and TZCNT(0) are defined to return 64, while
+// __builtin_clzll(0) / __builtin_ctzll(0) are undefined. A bare builtin remap would diverge on an
+// all-zero bit buffer, which is exactly the input a bitstream decoder can reach.
+//
+// Placed AFTER the intrinsic headers and as macros, so they shadow the header's own
+// `static __inline__` definitions rather than colliding with them. Guarded on the target feature,
+// not on the build: vmxcodec_avx2.cpp includes this header too and is compiled with
+// -mavx2 -mlzcnt -mbmi, so there __LZCNT__/__BMI__ are defined and the hardware instructions are
+// kept (that TU is reached only behind VMX_Create's `avx2 && bmi2` gate). The host build, which
+// passes -march=haswell, is unaffected by this block.
+#if defined(__GNUC__) && !defined(__LZCNT__)
+#define __lzcnt64(t) ((t) ? (unsigned long long)__builtin_clzll(t) : 64ull)
+#endif
+#if defined(__GNUC__) && !defined(__BMI__)
+#define _tzcnt_u64(t) ((t) ? (unsigned long long)__builtin_ctzll(t) : 64ull)
 #endif
 
 void VMX_BROADCAST_DC_8X8_128(short src, BYTE* dst, int stride, short addVal);
