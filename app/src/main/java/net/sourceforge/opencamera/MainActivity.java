@@ -2429,8 +2429,24 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
                         Log.i("OmtDebug", "not streaming — stop skipped");
                     break;
                 case STATUS:
+                    /*
+                     * The four ring counters, each read from its own atomic: admitted is the total the
+                     * other three are measured against and is never computed from them — arithmetic
+                     * that agrees with itself is exactly how the refused frames stayed hidden. They
+                     * were incremented on three encoder-side refusal paths (sender gone, unsizeable
+                     * buffer, packer refusal) with no getter at all, so a frame that was neither
+                     * delivered nor dropped — the eviction counter only covers evictions — vanished
+                     * from every tally, and a device whose HAL reported an unpackable geometry looked
+                     * to whoever was reading the log like a stream that was simply idle.
+                     */
+                    long[] ring = (omtStreamingManager != null)
+                            ? omtStreamingManager.getRingAccounting() : new long[4];
                     Log.i("OmtDebug", "status: streaming=" + streaming
-                            + " announcing=" + (omtStreamingManager != null && omtStreamingManager.isAnnouncing()));
+                            + " announcing=" + (omtStreamingManager != null && omtStreamingManager.isAnnouncing())
+                            + " | ring admitted=" + ring[0]
+                            + " delivered=" + ring[1]
+                            + " dropped=" + ring[2]
+                            + " refused=" + ring[3]);
                     break;
             }
         }

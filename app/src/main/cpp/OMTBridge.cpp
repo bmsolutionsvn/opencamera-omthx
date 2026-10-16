@@ -741,6 +741,45 @@ Java_net_sourceforge_opencamera_OMTSender_nativeGetRingDrops(
     return (jlong)g_ringDropped.load();
 }
 
+/**
+ * Frames the camera handed the ring since the sender was created — every frame the callback was
+ * asked to take, whatever became of it afterwards.
+ *
+ * The other three counters are only meaningful against this one: admitted is what
+ * delivered + dropped + refused + (the frames still in flight) has to add up to. It is reported as
+ * its own atomic, never computed from the others — a ring that lost a frame on a path nobody
+ * counted would otherwise agree with itself by construction and hide the loss.
+ */
+JNIEXPORT jlong JNICALL
+Java_net_sourceforge_opencamera_OMTSender_nativeGetRingAdmitted(
+        JNIEnv* /* env */, jobject /* this */) {
+    return (jlong)g_ringAdmitted.load();
+}
+
+/** Frames the encoder thread packed and posted to the sender since the sender was created. */
+JNIEXPORT jlong JNICALL
+Java_net_sourceforge_opencamera_OMTSender_nativeGetRingDelivered(
+        JNIEnv* /* env */, jobject /* this */) {
+    return (jlong)g_ringDelivered.load();
+}
+
+/**
+ * Frames the ring took from the camera and then threw away on the encoder side: no sender left to
+ * post to, a geometry no NV12 buffer could be sized for, or a pack the packer refused.
+ *
+ * This is the counter that used to be invisible. Three separate refusal paths incremented
+ * g_ringPackRefused and nothing could read it, so a frame that was neither delivered nor counted as
+ * a drop — the ring's eviction counter only covers evictions — vanished from every tally. A device
+ * whose HAL reported a geometry the packer refuses looked exactly like a stream that was simply
+ * idle: no error, no drops, no video. The status line now prints it next to the other three so the
+ * four add up in the log instead of in somebody's head.
+ */
+JNIEXPORT jlong JNICALL
+Java_net_sourceforge_opencamera_OMTSender_nativeGetRingRefused(
+        JNIEnv* /* env */, jobject /* this */) {
+    return (jlong)g_ringPackRefused.load();
+}
+
 
 /**
  * Get the number of currently connected receivers.

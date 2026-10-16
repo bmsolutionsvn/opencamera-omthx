@@ -316,6 +316,21 @@ public class OMTStreamingManager {
     }
 
     /**
+     * The native encoder ring's own accounting, for the debug `status` command, in this order:
+     * admitted, delivered, dropped (ring evictions), refused (encoder-side losses). All four are
+     * read straight from their own counters — admitted is NOT computed from the other three, because
+     * arithmetic that agrees with itself is exactly how a frame lost on an uncounted path stays
+     * hidden. Zero across the board when no sender exists.
+     */
+    public long[] getRingAccounting() {
+        if (omtSender == null) {
+            return new long[] { 0, 0, 0, 0 };
+        }
+        return new long[] { omtSender.getRingAdmitted(), omtSender.getRingDelivered(),
+                omtSender.getRingDrops(), omtSender.getRingRefused() };
+    }
+
+    /**
      * Get the current VMX profile ID.
      */
     public int getProfile() {
