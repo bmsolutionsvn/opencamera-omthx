@@ -623,29 +623,64 @@ public class OMTStreamingManager {
     private void cleanupStreaming() {
         // Release ImageReader only.
         //
-        // Detach the listener BEFORE closing, and give each step its own try/catch — the same
-        // discipline unregisterService() documents for the locks. Callbacks dispatch on the
-        // OMTStreamingThread HandlerThread while this runs on the main thread, so closing first and
-        // detaching second left a window where an already-queued callback saw a dead reader: that
-        // is the IllegalStateException the acquire guard now absorbs, and the detach order is what
-        // stops new work from arriving after the close. Nulling the field first also means
-        // getStreamingSurface() can never hand out a Surface whose reader is gone.
+        // THE FAILURE THIS PREVENTS. The reader used to be closed right here, on the main thread,
+        // while these callbacks dispatch on the OMTStreamingThread HandlerThread. A callback already
+        // in flight when stop arrived was inside nativeQueueFramePlanes copying the plane bytes the
+        // Image points at; ImageReader.close() frees those buffers underneath it, and the memcpy
+        // walked off unmapped memory. Measured on the emulator, twice in one battery run, ~20 ms
+        // after "Stopping all OMT services":
         //
-        // Neither call had any guard at all before, so whichever one threw first jumped the rest —
-        // including the `imageReader = null` — and the manager kept serving a closed reader.
+        //   F libc: Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR) in tid (OMTStreamingThr)
+        //   #00 libc.so (memcpy+953)
+        //   #03 libomtbridge.so (Java_net_sourceforge_opencamera_OMTSender_nativeQueueFramePlanes+869)
+        //   #10 OMTSender.queueFramePlanes   #16 OMTStreamingManager.sendFrame
+        //   #28 OMTStreamingManager$1.onImageAvailable   #34 ImageReader$1.run
+        //
+        // That is a process death no Java catch can reach — the acquire guard below catches
+        // IllegalStateException, not SIGSEGV — and it is what the emulator battery's S13 (20
+        // start/stop cycles) is red on. The only fix is ORDERING: the close has to run on the same
+        // looper as the callbacks, so it cannot begin until the callback in flight has returned.
+        // Hence posting the release to backgroundHandler instead of doing it here, and running it
+        // inline only when there is no handler left to post to. This is also why stopBackgroundThread
+        // uses quitSafely(): a queued release still runs while the looper drains.
+        //
+        // Each step keeps its own try/catch and the field is nulled first, mirroring the per-resource
+        // discipline unregisterService() documents: one step throwing must not jump the rest, and
+        // getStreamingSurface() must never hand out a Surface whose reader is being torn down.
         final ImageReader reader = imageReader;
-        if (reader != null) {
-            imageReader = null;
-            try {
-                reader.setOnImageAvailableListener(null, null);
-            } catch (Exception e) {
-                Log.e(TAG, "Failed to detach the ImageReader listener", e);
+        if (reader == null) {
+            return;
+        }
+        imageReader = null;
+        final Runnable release = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    // Detach first: no new callback may be scheduled against a reader about to die.
+                    reader.setOnImageAvailableListener(null, null);
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to detach the ImageReader listener", e);
+                }
+                try {
+                    reader.close();
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to close the ImageReader", e);
+                }
             }
+        };
+        final Handler handler = backgroundHandler;
+        boolean handedToCallbackThread = false;
+        if (handler != null) {
             try {
-                reader.close();
+                handedToCallbackThread = handler.post(release);
             } catch (Exception e) {
-                Log.e(TAG, "Failed to close the ImageReader", e);
+                Log.e(TAG, "Failed to post the ImageReader release to the callback thread", e);
             }
+        }
+        if (!handedToCallbackThread) {
+            // No background looper to serialize with (never started, or already quit). Nothing is
+            // dispatching on it, so releasing here cannot race a callback.
+            release.run();
         }
         // The packed-frame buffers live in the native ring now, and the encoder thread that owns
         // them is stopped and joined by OMTSender.cleanup() -> nativeCleanup, which drains what the

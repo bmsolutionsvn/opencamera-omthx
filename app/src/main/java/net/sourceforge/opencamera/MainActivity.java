@@ -3693,12 +3693,14 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
                 case PreferenceKeys.OmtStreamingQualityKey:
                     if (omtStreamingManager != null && omtStreamingManager.isStreaming()) {
                         try {
-                            // Read it the same way everybody else does. This site defaulted to
+                            // Read it the same way everybody else does. This site once defaulted to
                             // "50" (MEDIUM) while MyApplicationInterface.getOmtStreamingQuality()
-                            // defaults to "1" (LOW), so with the preference never touched the
+                            // defaulted to "1" (LOW), so with the preference never touched the
                             // announcement started at LOW and the first live change jumped the
                             // encoder to ~100 Mbps — a 2.3x bitrate spike on Wi-Fi, which is exactly
                             // the congestion that makes a stream look "unstable compared to NDI".
+                            // That is why there is one reader here and why the XML default and the
+                            // Java default are the same value (Auto) — see getOmtStreamingQuality.
                             int quality = applicationInterface.getOmtStreamingQuality();
                             omtStreamingManager.setQuality(quality);
                             if (MyDebug.LOG)

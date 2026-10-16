@@ -187,7 +187,7 @@
             android:summary="Low recommended for WiFi stability"
             android:entries="@array/preference_omt_quality_entries"
             android:entryValues="@array/preference_omt_quality_values"
-            android:defaultValue="1"
+            android:defaultValue="0"
             android:dependency="preference_omt_streaming_enabled"
             />
 
