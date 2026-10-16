@@ -4,6 +4,7 @@
  */
 
 #include "OMTChannel.h"
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <poll.h>
@@ -33,6 +34,40 @@ namespace {
 /// or a frame type this direction does not accept. The receive buffer is sized from the same
 /// constant, so an accepted frame can never fail to fit.
 constexpr int32_t kMaxControlPayload = 65535;
+
+/// The kernel naming the connection dead is the ONLY positive evidence that a peer is gone.
+/// Everything else — above all a peer that simply stopped reading, or a read that was interrupted
+/// or found nothing to take — is back-pressure or a race, and must leave the channel alone.
+///
+/// A peer that closed only its WRITE half (a pure receiver that shutdown(SHUT_WR)s after the
+/// subscribe XML, which is what OBS, libomtnet and our own desktop receiver do) is deliberately NOT
+/// in this list: that state is invisible to the read side and irrelevant to us. It becomes a death
+/// only if a later send errors, which is the difference between "the viewer hung up" and "the viewer
+/// is a listener with nothing to say".
+///
+/// Ported from the desktop vendored copy (nodos plugins/yd.net.ompout/vendor/libomtcpp/src/
+/// OMTChannel.cpp), which has carried this list since 2026-10-13; this side never received it.
+bool IsPeerGoneErrno(int e) {
+    switch (e) {
+        case EPIPE:         // peer closed its side; our writes now fail
+        case ECONNRESET:    // peer (or a middlebox) sent RST
+        case ENOTCONN:      // the connection is already gone
+        case ECONNABORTED:  // locally aborted connection
+        case ESHUTDOWN:     // send after the connection was shut down
+        case EHOSTUNREACH:
+        case ENETUNREACH:
+        case ENETDOWN:
+            return true;
+        default:
+            return false;    // EAGAIN/ENOMEM/EINVAL/...: transient, never a death sentence
+    }
+}
+
+/// Consecutive transient (non-fatal) read results we tolerate with no progress in sight. The
+/// receive path only reaches this counter when select() reported the socket readable and recv() then
+/// refused the data, so a streak this long is not a slow peer — it is a socket that will never
+/// deliver, and looping on it would pin a core at 100% CPU for the life of the app.
+constexpr int kMaxConsecutiveTransientReads = 100;
 } // namespace
 
 Channel::Channel(int socketFd, struct sockaddr_in address, 
@@ -417,6 +452,9 @@ void Channel::receiverLoop() {
     // for sending something conforming.
     std::vector<uint8_t> recvBuffer(FrameHeader::SIZE + static_cast<size_t>(kMaxControlPayload));
     size_t bufferPos = 0;
+    // Consecutive transient read results, reset by any byte actually taken. See
+    // kMaxConsecutiveTransientReads for why a streak, however long it stays alive, must end.
+    int transientStreak = 0;
 
     while (running_ && connected_) {
         // socketFd_ is cleared by closeSocket()/disconnect() on another thread. FD_SET(-1) and
@@ -454,17 +492,78 @@ void Channel::receiverLoop() {
         ssize_t received = recv(fd, recvBuffer.data() + bufferPos,
                                 recvBuffer.size() - bufferPos, 0);
 
-        if (received <= 0) {
-            if (received == 0) {
-                LOGI("receiverLoop: connection closed by peer");
+        // ---- what a failed or empty read means (ported from the desktop vendored copy) --------
+        // The whole loop used to be `if (received <= 0) { …; connected_ = false; break; }`, and the
+        // errno test below it only decided which line to LOG, not whether to die. Two perfectly
+        // healthy peers were killed by it, both measured against this exact file (qa-ompin/
+        // FOREIGN-IN-DIAGNOSTICS-20261015.md, scenarios D1 and D4):
+        //
+        //   * D1 — a peer that shutdown(SHUT_WR)s after subscribing. That is what a pure receiver
+        //     is: OBS, libomtnet, and our own OmpIn all close the half they never intend to write
+        //     from. recv() then answers 0 forever, the channel is marked dead, and the subscriber
+        //     gets the 86-byte greeting and no video at all — measured 86 bytes / 0 frames against
+        //     3.9 MB / 179 frames for the identical peer with no half-close. The only difference
+        //     between the two runs was the half-close.
+        //   * D4 — one spurious readability: select() said readable, and a competing reader (or an
+        //     SO_RCVLOWAT race) took the bytes before recv() ran. recv() answers EAGAIN, the channel
+        //     dies, and the SUBSCRIBE ITSELF never registers — 86 bytes, then PEER_CLOSED. Measured
+        //     239/239 frames once this branch was applied as a control.
+        //
+        // A dead channel is also silent, which is why this survived an audit cycle: only
+        // ~Channel() closes the descriptor, and that runs from cleanupDisconnected(), which is only
+        // reached from Sender::send()/getStats(). A peer that is not getting frames has no way to
+        // say so, and the receiver side just sits in CONNECTING with an empty LastError.
+        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+            // Nothing to read right now. NOT a disconnect — keep the channel and poll again.
+            //
+            // Logged once per episode, not per attempt: the desktop copy learned this the hard way
+            // when the per-attempt form printed 802 identical warnings in three minutes against one
+            // slow OBS. The flag is re-armed by the next read that actually returns bytes (below),
+            // so a genuinely NEW stall is still reported.
+            if (!warnedReadTransient_.exchange(true, std::memory_order_relaxed)) {
+                readTransientWarnings_++;
+                LOGE("receiverLoop: %d consecutive transient reads (last errno %d, %s) — peer kept",
+                     transientStreak + 1, errno, strerror(errno));
+            }
+            if (++transientStreak > kMaxConsecutiveTransientReads) {
+                LOGE("receiverLoop: %d transient reads in a row with no byte taken — giving up on "
+                     "this socket", transientStreak);
+                connected_ = false;
+                break;
+            }
+            continue;
+        }
+        if (received < 0) {
+            if (IsPeerGoneErrno(errno)) {
+                LOGE("receiverLoop: peer gone (%d, %s)", errno, strerror(errno));
                 noteCloseReason(CloseReason::PeerClosed);
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                LOGE("receiverLoop: recv error %d", errno);
+            } else {
+                // An errno the kernel does not use to say "the peer is gone". The read path cannot
+                // make progress on it either, so it ends the channel — but it is named, because
+                // "a peer hung up" and "the read path broke" must not be the same observable state.
+                LOGE("receiverLoop: recv error %d (%s) — not a peer-gone errno", errno, strerror(errno));
                 noteCloseReason(CloseReason::RecvError);
             }
             connected_ = false;
             break;
         }
+        if (received == 0) {
+            // Read-half EOF is a STATE, not an event to keep polling for: the socket stays readable
+            // forever, so the only correct response is to stop reading (break, do not continue) while
+            // leaving the channel ALIVE. The send side is a different half of the connection and
+            // senderLoop must keep running — this whole file exists to push video at a peer that has
+            // nothing left to say.
+            //
+            // A full close still gets reaped: it surfaces later as a send error (sendWithDeadline
+            // fails on POLLHUP/POLLERR or on the kernel's own errno), which clears connected_ under
+            // the write lock, and cleanupDisconnected() then joins and closes the channel.
+            LOGI("receiverLoop: peer write-half closed (EOF); stopping reads, keep streaming");
+            break;
+        }
+
+        // Bytes really moved: re-arm the once-per-episode warning and clear the transient streak.
+        transientStreak = 0;
+        warnedReadTransient_.store(false, std::memory_order_relaxed);
 
         bytesReceived_ += received;
         bufferPos += received;

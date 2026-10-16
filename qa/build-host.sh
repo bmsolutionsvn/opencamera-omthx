@@ -1357,6 +1357,108 @@ PY
 then build_and_run rv-mutant-no-reason "$ROOT/qa/receiver-validation.cpp" "$MR8" fail
 fi
 
+echo "== receiver-peer-lifetime: what a read that returned nothing is allowed to conclude =="
+build_and_run_channel rp-fixed "$ROOT/qa/receiver-peer-lifetime.cpp" "$ROOT/libomt/cpp" pass
+
+# The fix reverted wholesale: OMTChannel.cpp from the commit this branch sits on. The HEADERS stay
+# as the tree has them — the pre-fix .cpp never touches warnedReadTransient_, and reverting the
+# header that merely declares it would fail the BUILD rather than the gate (see the sw-prefix note).
+#
+# Pinned to a051d730 — master, the commit this branch sits on. It already carries the poll()-based
+# wait and the CloseReason bookkeeping (both arrived with #23), so what goes red here is the
+# EOF/EAGAIN half and nothing else. The branch's original pin, 3d64d14a, was the old stack's #22
+# tip: it predates #23, and against today's tree its file is missing the validation the receiver
+# gate also asserts, so it would have measured two defects at once. This used to be HEAD~1, which
+# is a defect, not a convenience: HEAD~1 is relative to whatever is checked out, and when a branch
+# STACKS on this one (fix/omt-receiver-poll-fd-setsize sits on this commit), HEAD~1 on the child is
+# THIS tip — already EOF-fixed — and the must-fail control silently extracts a fixed file and
+# passes, turning the gate into a no-op (measured: rp-prefix went "pass but expected fail" on the
+# stacked branch). A pre-fix baseline is an immutable commit. QA_BASE_RP overrides; it must name a
+# commit that is reachable from master.
+
+RPBASE=${QA_BASE_RP:-a051d730}
+PFRP="$SCRATCH/pre-fix-peer-lifetime"; rm -rf "$PFRP"; mkdir -p "$PFRP"
+cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$PFRP"/
+extract_rev_file "$RPBASE" "libomt/cpp/OMTChannel.cpp" "$PFRP/OMTChannel.cpp"
+must_not_grep "$PFRP/OMTChannel.cpp" 'IsPeerGoneErrno'
+must_grep     "$PFRP/OMTChannel.cpp" 'connection closed by peer'
+build_and_run_channel rp-prefix "$ROOT/qa/receiver-peer-lifetime.cpp" "$PFRP" fail
+
+# RP1: read-half EOF back to channel death — the D1 defect in one line. A pure receiver (a peer that
+# shutdown(SHUT_WR)s after subscribing: OBS, libomtnet, our own OmpIn) gets the greeting and nothing
+# else, because recv() answering 0 was read as "the peer is gone" rather than "the peer has nothing
+# left to say".
+M_RP1=$(fresh_copy mutant-rp-eof-death)
+if apply_mutant rp-mutant-eof-death "$M_RP1/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ('            LOGI("receiverLoop: peer write-half closed (EOF); stopping reads, keep streaming");\n'
+       '            break;')
+assert s.count(old) == 1, "EOF-as-state branch not found"
+new = ('            LOGE("MUTANT: EOF is death");\n'
+       '            connected_ = false;\n'
+       '            break;')
+open(p, "w").write(s.replace(old, new, 1))
+PY
+then build_and_run_channel rp-mutant-eof-death "$ROOT/qa/receiver-peer-lifetime.cpp" "$M_RP1" fail
+fi
+
+# RP2: the transient read back to channel death — the D4 defect. recv() answering EAGAIN after
+# select() called the socket readable kills the channel before the SUBSCRIBE registers, so the
+# viewer sits at 0 frames behind a socket that is still open.
+M_RP2=$(fresh_copy mutant-rp-eagain-death)
+if apply_mutant rp-mutant-eagain-death "$M_RP2/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "        if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {"
+assert s.count(old) == 1, "transient-read branch not found"
+open(p, "w").write(s.replace(old, "        if (false) {  // MUTANT: a transient read is fatal again", 1))
+PY
+then build_and_run_channel rp-mutant-eagain-death "$ROOT/qa/receiver-peer-lifetime.cpp" "$M_RP2" fail
+fi
+
+# RP3: the streak guard removed. "Keep the channel alive on a transient read" without a bound is not
+# a fix, it is a spin: a socket that is permanently readable and permanently empty pins a core for
+# the life of the app and is never reaped. The counter still runs; only the verdict is gone.
+M_RP3=$(fresh_copy mutant-rp-no-streak-guard)
+if apply_mutant rp-mutant-no-streak-guard "$M_RP3/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "            if (++transientStreak > kMaxConsecutiveTransientReads) {"
+assert s.count(old) == 1, "streak guard not found"
+open(p, "w").write(s.replace(old, "            ++transientStreak;\n            if (false) {  // MUTANT: the transient path never ends", 1))
+PY
+then build_and_run_channel rp-mutant-no-streak-guard "$ROOT/qa/receiver-peer-lifetime.cpp" "$M_RP3" fail
+fi
+
+# RP4: the warning stops latching, i.e. it prints on every attempt. That is the shape that produced
+# 802 identical warnings in three minutes against one slow OBS on the desktop copy; the flag is what
+# makes it one line per episode, so a warning that cannot latch is the outage printed out.
+M_RP4=$(fresh_copy mutant-rp-no-latch)
+if apply_mutant rp-mutant-no-latch "$M_RP4/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "            if (!warnedReadTransient_.exchange(true, std::memory_order_relaxed)) {"
+assert s.count(old) == 1, "warn-once latch not found"
+open(p, "w").write(s.replace(old, "            if (true) {  // MUTANT: logs per attempt, never latches", 1))
+PY
+then build_and_run_channel rp-mutant-no-latch "$ROOT/qa/receiver-peer-lifetime.cpp" "$M_RP4" fail
+fi
+
+# RP5: the warning latches and never re-arms. The storm is gone, but so is every stall after the
+# first one — the second viewer in the room is silent, which is the failure the per-channel flag
+# (rather than the old `static bool`) exists to avoid.
+M_RP5=$(fresh_copy mutant-rp-no-rearm)
+if apply_mutant rp-mutant-no-rearm "$M_RP5/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "        warnedReadTransient_.store(false, std::memory_order_relaxed);"
+assert s.count(old) == 1, "re-arm on progress not found"
+open(p, "w").write(s.replace(old, "        ; // MUTANT: the episode never ends, so nothing new is ever reported", 1))
+PY
+then build_and_run_channel rp-mutant-no-rearm "$ROOT/qa/receiver-peer-lifetime.cpp" "$M_RP5" fail
+fi
+
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
   echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"
