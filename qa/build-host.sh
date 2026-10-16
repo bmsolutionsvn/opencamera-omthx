@@ -1459,6 +1459,52 @@ PY
 then build_and_run_channel rp-mutant-no-rearm "$ROOT/qa/receiver-peer-lifetime.cpp" "$M_RP5" fail
 fi
 
+echo "== receiver-high-fd: the subscriber's descriptor may not index a stack-resident fd_set =="
+build_and_run_channel hp-fixed "$ROOT/qa/receiver-high-fd.cpp" "$ROOT/libomt/cpp" pass
+
+# The fix reverted wholesale: OMTChannel.cpp from a revision that still waits for the peer with
+# select()/FD_SET. Headers stay as the tree's (see the sw-prefix note).
+#
+# Pinned to adf620a3 — the last master revision whose receiverLoop still calls FD_SET. It has to be
+# a historical one: master's own file (a051d730, the commit the branch below this one sits on)
+# ALREADY waits with poll(), because #23 carried the switch in with it. Pinning the parent commit
+# would therefore extract an already-fixed file and hp-prefix would pass — the same no-op gate
+# that made HEAD~1 a defect on stacked branches. adf620a3 is the same revision qa/build-host.sh
+# pins receiver-validation's pre-fix copy to, so it is known to build against this tree's headers
+# (its 4-arg sendWithDeadline matches the declaration), and it is reachable from master.
+# This used to be 65f2924b — the old stack's #25 tip, which is no longer reachable from any remote
+# ref, so a fresh clone could not resolve it. QA_BASE_HP overrides; it must name a commit whose
+# receiverLoop still waits with select(), or hp-prefix measures nothing and must be refused.
+
+HPBASE=${QA_BASE_HP:-adf620a3}
+PFHP="$SCRATCH/pre-fix-high-fd"; rm -rf "$PFHP"; mkdir -p "$PFHP"
+cp "$ROOT"/libomt/cpp/*.cpp "$ROOT"/libomt/cpp/*.h "$PFHP"/
+extract_rev_file "$HPBASE" "libomt/cpp/OMTChannel.cpp" "$PFHP/OMTChannel.cpp"
+must_grep     "$PFHP/OMTChannel.cpp" 'FD_SET(socketFd_, &readfds)'
+must_not_grep "$PFHP/OMTChannel.cpp" '::poll(&pfd'
+build_and_run_channel hp-prefix "$ROOT/qa/receiver-high-fd.cpp" "$PFHP" fail
+
+# HP1: the 0f95942 switch undone by hand, on the current tree. hp-prefix proves the historical
+# state; this proves the same thing about THIS commit's source, with the read-result semantics of
+# the commit below it unchanged — so the only difference the child can see is how it waits. Under a
+# select() build the child dies on ASan's stack-buffer-overflow inside receiverLoop, and the parent
+# scores the case red rather than reading a truncated log as a pass.
+M_HP1=$(fresh_copy mutant-hp-select)
+if apply_mutant hp-mutant-select "$M_HP1/OMTChannel.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+s = s.replace("#include <netinet/tcp.h>\n",
+              "#include <netinet/tcp.h>\n#include <sys/select.h>  // MUTANT: select() is back\n", 1)
+old = "        struct pollfd pfd{fd, POLLIN, 0};\n        int sel = ::poll(&pfd, 1, 100);"
+assert s.count(old) == 1, "the poll() wait is not where this tree put it"
+new = """        fd_set readfds; FD_ZERO(&readfds); FD_SET(fd, &readfds);   // MUTANT: FD_SETSIZE is 1024
+        struct timeval tv{0, 100000};
+        int sel = select(fd + 1, &readfds, nullptr, nullptr, &tv);"""
+open(p, "w").write(s.replace(old, new, 1))
+PY
+then build_and_run_channel hp-mutant-select "$ROOT/qa/receiver-high-fd.cpp" "$M_HP1" fail
+fi
+
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
   echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"

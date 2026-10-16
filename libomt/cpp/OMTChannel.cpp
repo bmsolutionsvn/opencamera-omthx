@@ -64,9 +64,9 @@ bool IsPeerGoneErrno(int e) {
 }
 
 /// Consecutive transient (non-fatal) read results we tolerate with no progress in sight. The
-/// receive path only reaches this counter when select() reported the socket readable and recv() then
-/// refused the data, so a streak this long is not a slow peer — it is a socket that will never
-/// deliver, and looping on it would pin a core at 100% CPU for the life of the app.
+/// receive path only reaches this counter when the readiness call reported the socket readable and
+/// recv() then refused the data, so a streak this long is not a slow peer — it is a socket that will
+/// never deliver, and looping on it would pin a core at 100% CPU for the life of the app.
 constexpr int kMaxConsecutiveTransientReads = 100;
 } // namespace
 
@@ -467,6 +467,13 @@ void Channel::receiverLoop() {
         // phone that has been up for a day, and routine in the host QA process — it wrote past the
         // end of that array; ASan reports it as a stack-buffer-overflow inside receiverLoop. select()
         // then refuses the call anyway (nfds > FD_SETSIZE). poll() has no descriptor ceiling.
+        //
+        // revents is deliberately NOT consulted: recv() is what reports the kernel's verdict, and
+        // the read-result handling below is what decides whether the channel survives (a peer that
+        // closed only its write half shows POLLHUP and must not be treated as gone). The desktop
+        // vendored copy made this switch in 0f95942 on 2026-10-13 and does the same; this side never
+        // received it. It is also why the two fixes are two commits: this one changes how the loop
+        // waits, not what a result means.
         struct pollfd pfd{fd, POLLIN, 0};
         int sel = ::poll(&pfd, 1, 100);  // 100ms tick: running_ stays observable
 
