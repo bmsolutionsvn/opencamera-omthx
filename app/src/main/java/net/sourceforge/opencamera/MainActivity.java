@@ -2396,9 +2396,16 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             // "OMTStreamingManager: Starting OMT streaming: 0x0@30fps" and a stream that
             // announces but carries 0 video. The on-screen button can't be pressed that early,
             // which is why this never bit real users. Wait for a non-zero profile too.
+            // The readiness gate belongs to START_STREAM ONLY. stop_stream and status touch no
+            // camera state — and gating them made them silently die whenever the activity is not
+            // in the foreground: on the phone, backgrounding the app pauses the camera, the video
+            // profile drops to 0x0, and a stop_stream issued then hit the 30s cap unexecuted
+            // (measured on RMX3867: "command accepted: STATUS", no "executing" line, ever). The
+            // operator loses the stop button exactly when the app slipped out of the foreground.
             VideoProfile vp = (preview == null) ? null : preview.getVideoProfile();
-            boolean ready = preview != null && !preview.isOpeningCamera()
-                    && vp != null && vp.videoFrameWidth > 0 && vp.videoFrameHeight > 0;
+            boolean ready = pendingOmtDebug != OmtDebugCommands.Command.START_STREAM
+                    || (preview != null && !preview.isOpeningCamera()
+                        && vp != null && vp.videoFrameWidth > 0 && vp.videoFrameHeight > 0);
             if (!ready) {
                 if (++omtDebugTicks >= 60) {
                     Log.e("OmtDebug", "camera not ready after 30s — command " + pendingOmtDebug
