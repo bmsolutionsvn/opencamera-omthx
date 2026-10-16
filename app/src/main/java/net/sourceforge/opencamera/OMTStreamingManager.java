@@ -339,16 +339,18 @@ public class OMTStreamingManager {
 
             if (!isStreaming || omtSender == null) {
                 // Drain the queue to prevent backpressure
-                Image image = reader.acquireLatestImage();
+                Image image = acquireLatestQuietly(reader, "drain");
                 if (image != null) {
                     image.close();
                 }
                 return;
             }
 
-            Image image = reader.acquireLatestImage();
+            Image image = acquireLatestQuietly(reader, "send");
             if (image == null) {
-                Log.w(TAG, "acquireLatestImage returned null");
+                // Either nothing was pending or the reader was closed underneath us — the second
+                // case is already counted and logged by acquireLatestQuietly. Neither is a frame.
+                if (DEBUG_LOGS) Log.d(TAG, "acquireLatestImage returned null");
                 return;
             }
 
@@ -359,6 +361,37 @@ public class OMTStreamingManager {
             }
         }
     };
+
+    /** How many times a callback fired against an already-closed ImageReader. */
+    private int acquireOnClosedReaderCount = 0;
+
+    /**
+     * acquireLatestImage(), for a reader that another thread may be closing right now.
+     *
+     * The old code called reader.acquireLatestImage() bare, twice, outside any try — the only
+     * guard in the callback wrapped sendFrame(), not the acquire — and cleanupStreaming() closes
+     * the reader from the main thread (stopStreaming()/stopAll())
+     * while these callbacks dispatch on the OMTStreamingThread HandlerThread. A callback already
+     * queued when stop arrived, or one already in flight, then threw IllegalStateException("Image
+     * Reader is not prepared") from a HandlerThread with no catch anywhere above it: logcat showed
+     * the F DEBUG tombstone and the whole camera app vanished mid-stream. To a user that is "the
+     * camera crashed the second I pressed stop", and it reproduced on a cycle (see the emulator
+     * battery's S13, 20 start/stop cycles). A refused late frame is a dropped frame; an uncaught
+     * exception in a callback is a dead process.
+     */
+    private Image acquireLatestQuietly(ImageReader reader, String where) {
+        try {
+            return reader.acquireLatestImage();
+        } catch (IllegalStateException e) {
+            acquireOnClosedReaderCount++;
+            if (acquireOnClosedReaderCount <= 3 || (DEBUG_LOGS && acquireOnClosedReaderCount % 30 == 0)) {
+                Log.w(TAG, where + ": acquireLatestImage on an ImageReader that was already closed ("
+                        + acquireOnClosedReaderCount + " time(s)) — a queued callback lost the race "
+                        + "with cleanupStreaming(); the frame is dropped, the process stays up");
+            }
+            return null;
+        }
+    }
 
     private int sentFrameCount = 0;
     private int sendFailureCount = 0;
@@ -548,10 +581,31 @@ public class OMTStreamingManager {
      * Cleanup streaming only (ImageReader), keep OMT sender and mDNS active.
      */
     private void cleanupStreaming() {
-        // Release ImageReader only
-        if (imageReader != null) {
-            imageReader.close();
+        // Release ImageReader only.
+        //
+        // Detach the listener BEFORE closing, and give each step its own try/catch — the same
+        // discipline unregisterService() documents for the locks. Callbacks dispatch on the
+        // OMTStreamingThread HandlerThread while this runs on the main thread, so closing first and
+        // detaching second left a window where an already-queued callback saw a dead reader: that
+        // is the IllegalStateException the acquire guard now absorbs, and the detach order is what
+        // stops new work from arriving after the close. Nulling the field first also means
+        // getStreamingSurface() can never hand out a Surface whose reader is gone.
+        //
+        // Neither call had any guard at all before, so whichever one threw first jumped the rest —
+        // including the `imageReader = null` — and the manager kept serving a closed reader.
+        final ImageReader reader = imageReader;
+        if (reader != null) {
             imageReader = null;
+            try {
+                reader.setOnImageAvailableListener(null, null);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to detach the ImageReader listener", e);
+            }
+            try {
+                reader.close();
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to close the ImageReader", e);
+            }
         }
         // The packed-frame buffers live in the native ring now, and the encoder thread that owns
         // them is stopped and joined by OMTSender.cleanup() -> nativeCleanup, which drains what the
