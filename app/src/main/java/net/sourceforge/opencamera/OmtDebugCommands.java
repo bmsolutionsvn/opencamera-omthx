@@ -42,5 +42,23 @@ public final class OmtDebugCommands {
         }
     }
 
+    /**
+     * Whether a raw extra carries a command that MainActivity must CONSUME (removeExtra) once it
+     * has read it.
+     *
+     * Why this is a rule and not an afterthought: getIntent() hands back the same Intent the system
+     * keeps for the activity, so the extra survives recreate() — including the app's own recreate()
+     * in startOmtStreaming()'s Camera2 auto-switch. A command that is read but never consumed is
+     * not history, it is a standing order: one stop_stream issued over adb would silently stop a
+     * stream the user started by hand afterwards, replaying on every rotation, dark-mode toggle and
+     * activity recreation until the process was killed.
+     *
+     * Kept as a pure function over the raw string so the WHEN is host-testable; the removeExtra
+     * call itself needs a real Intent and therefore lives in MainActivity.
+     */
+    public static boolean isConsumableCommand(String raw) {
+        return parse(raw) != null;
+    }
+
     private OmtDebugCommands() {}
 }

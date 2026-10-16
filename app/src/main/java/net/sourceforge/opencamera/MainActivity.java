@@ -2344,10 +2344,32 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         Intent intent = getIntent();
         if (intent == null || intent.getExtras() == null)
             return;
-        OmtDebugCommands.Command cmd =
-                OmtDebugCommands.parse(intent.getExtras().getString(OmtDebugCommands.EXTRA_COMMAND));
+        String raw = intent.getExtras().getString(OmtDebugCommands.EXTRA_COMMAND);
+        OmtDebugCommands.Command cmd = OmtDebugCommands.parse(raw);
         if (cmd == null)
             return; // no command (normal launch) — stay completely out of the way
+        /*
+         * CONSUME the extra here, on BOTH paths that reach this method (onCreate and
+         * onNewIntent/setIntent both read getIntent(), so this one call site covers both), and
+         * before the debuggable gate below — a release build that logs and ignores a command must
+         * still not carry it forward.
+         *
+         * What the old code looked like to a user: getIntent() returns the same Intent the system
+         * keeps for the activity, so an extra that is only ever READ survives recreate() — the
+         * Camera2 auto-switch inside startOmtStreaming() does exactly that, and so does a rotation
+         * or a dark-mode toggle. A stop_stream issued over adb an hour earlier came back as a
+         * standing order: the next recreation replayed it and silently stopped the stream the user
+         * had just started by hand, with the only clue in the log ("command accepted:
+         * STOP_STREAM" at a moment nobody pressed anything). Forcing the process down was the only
+         * way to clear it. See OmtDebugCommands.isConsumableCommand for the rule; removeExtra
+         * itself needs a real Intent, so the replay regression is proven by the emulator battery's
+         * S2 (a genuine recreation via `cmd uimode night`), not by a JVM test.
+         */
+        if (OmtDebugCommands.isConsumableCommand(raw)) {
+            intent.removeExtra(OmtDebugCommands.EXTRA_COMMAND);
+            if (MyDebug.LOG)
+                Log.d("OmtDebug", "command extra consumed — it cannot replay on recreation");
+        }
         if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
             Log.w("OmtDebug", "command '" + cmd + "' ignored: not a debuggable build");
             return;
