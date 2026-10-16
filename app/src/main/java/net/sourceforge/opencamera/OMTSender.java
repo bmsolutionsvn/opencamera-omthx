@@ -164,6 +164,10 @@ public class OMTSender {
      * @param *Size      the readable bytes of that plane ({@code getBuffer().limit()})
      * @param *RowStride / *PixelStride from the same {@code Image.Plane}
      * @return true if the frame was packed and at least one receiver took it
+     *
+     * @apiNote SYNCHRONOUS: this call packs, encodes and sends before it returns, so the caller pays
+     *          for the encode. The camera path is {@link #queueFramePlanes}; nothing that runs on an
+     *          {@link android.media.ImageReader} callback should call this.
      */
     public boolean sendFramePlanes(ByteBuffer dst,
                                    ByteBuffer y, int ySize, int yRowStride, int yPixelStride,
@@ -198,6 +202,68 @@ public class OMTSender {
         return nativeSendFramePlanes(dst, y, ySize, yRowStride, yPixelStride,
                                      u, uSize, uRowStride, uPixelStride,
                                      v, vSize, vRowStride, vPixelStride, width, height);
+    }
+
+    /**
+     * Hand one Camera2 {@code ImageFormat.YUV_420_888} frame to the native encoder thread.
+     *
+     * This is the capture path. It does the plane-descriptor checks, copies the plane bytes into a
+     * ring slot and returns — the pack, the encode and the socket write happen on a dedicated
+     * encoder thread, in the order the frames arrived. An {@code ImageReader} callback that packs and
+     * encodes inline caps the delivered frame rate at 1/(its own cost) no matter what the camera was
+     * asked for, which is the "~14 fps delivered, 30 declared" report this method exists to fix.
+     *
+     * @param y/u/v      the plane buffers from {@code Image.Plane.getBuffer()}, position 0
+     * @param *Size      the readable bytes of that plane ({@code getBuffer().limit()})
+     * @param *RowStride / *PixelStride from the same {@code Image.Plane}
+     * @return true if this frame was admitted to the ring; false if it was refused. A {@code true}
+     *         here means "the encoder thread owns it now", not "a receiver got it" — see
+     *         {@link #getFramesSent()} for that and {@link #getRingDrops()} for what never got there.
+     */
+    public boolean queueFramePlanes(ByteBuffer y, int ySize, int yRowStride, int yPixelStride,
+                                    ByteBuffer u, int uSize, int uRowStride, int uPixelStride,
+                                    ByteBuffer v, int vSize, int vRowStride, int vPixelStride,
+                                    int width, int height) {
+        if (!isInitialized) {
+            Log.e(TAG, "Cannot queue frame: OMTSender not initialized");
+            return false;
+        }
+        if (y == null || u == null || v == null) {
+            Log.e(TAG, "Cannot queue frame: a plane buffer is null");
+            return false;
+        }
+        if (!y.isDirect() || !u.isDirect() || !v.isDirect()) {
+            Log.e(TAG, "Cannot queue frame: plane buffers must all be direct ByteBuffers");
+            return false;
+        }
+        if (y.position() != 0 || u.position() != 0 || v.position() != 0) {
+            // The native side addresses the allocation base, so a positioned buffer would be read
+            // from the wrong offset. Refuse it rather than encode the wrong pixels.
+            Log.e(TAG, "Cannot queue frame: plane buffers must be positioned at 0");
+            return false;
+        }
+        if (nv12BufferSize(yRowStride, height) < 0) {
+            Log.e(TAG, "Cannot queue frame: no packed NV12 size for stride=" + yRowStride
+                    + " height=" + height);
+            return false;
+        }
+
+        return nativeQueueFramePlanes(y, ySize, yRowStride, yPixelStride,
+                                      u, uSize, uRowStride, uPixelStride,
+                                      v, vSize, vRowStride, vPixelStride, width, height);
+    }
+
+    /**
+     * Frames the native encoder ring evicted to keep the capture callback non-blocking, since the
+     * sender was created.
+     *
+     * Delivered rate alone cannot tell "the camera is producing 30 fps and the encoder keeps up" from
+     * "the camera is producing 30 fps and the ring throws most of them away"; this is the number that
+     * separates them, and it belongs next to {@link #getFramesDropped()} (network drops) precisely so
+     * the two stalls cannot be confused for each other.
+     */
+    public long getRingDrops() {
+        return isInitialized ? nativeGetRingDrops() : 0;
     }
 
     /**
@@ -304,6 +370,13 @@ public class OMTSender {
                                                  ByteBuffer u, int uSize, int uRowStride, int uPixelStride,
                                                  ByteBuffer v, int vSize, int vRowStride, int vPixelStride,
                                                  int width, int height);
+
+    private native boolean nativeQueueFramePlanes(ByteBuffer y, int ySize, int yRowStride, int yPixelStride,
+                                                  ByteBuffer u, int uSize, int uRowStride, int uPixelStride,
+                                                  ByteBuffer v, int vSize, int vRowStride, int vPixelStride,
+                                                  int width, int height);
+
+    private native long nativeGetRingDrops();
 
     private native int nativeGetConnectionCount();
 
