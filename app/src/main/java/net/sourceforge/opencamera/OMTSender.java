@@ -323,6 +323,25 @@ public class OMTSender {
     }
 
     /**
+     * Touch the native sender's statistics path once, from a thread that is not sending.
+     *
+     * The number is incidental — this call exists for what it triggers on the way in.
+     * {@code Sender::getStats()} is one of only two places that run {@code cleanupDisconnected()},
+     * the reap that unlinks a channel whose receiver has gone; the other is {@code Sender::send()},
+     * which stops running the instant the camera frames stop. {@link #getConnectionCount()} counts
+     * and does NOT reap, so an idle announcement (streaming stopped, mDNS still up, a viewer that
+     * has hung up) kept that viewer's socket fd, its senderLoop thread and its AsyncPool for the
+     * rest of the announcement's life — the OMTChannel half-close rule deliberately keeps a peer
+     * that closed only its write half marked connected, so nothing else ever notices it is gone.
+     *
+     * Cheapest existing path to that reap: one {@code getStats()} through the frame-sent getter. No
+     * C++ reaping semantics are changed or duplicated here.
+     */
+    public long pollStatsForReaping() {
+        return isInitialized ? nativeGetFramesSent() : 0;
+    }
+
+    /**
      * Get total frames dropped since initialization.
      * Frames are dropped when the receiver can't keep up (network congestion).
      */

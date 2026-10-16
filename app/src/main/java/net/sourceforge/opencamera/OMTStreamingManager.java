@@ -528,6 +528,27 @@ public class OMTStreamingManager {
                     return;
                 }
 
+                /*
+                 * Reap the subscribers that are gone — every tick, whether or not frames are
+                 * flowing.
+                 *
+                 * The only code that unlinks a dead channel is cleanupDisconnected(), and it runs
+                 * from Sender::send() and Sender::getStats(). send() is dead the moment the camera
+                 * frames stop, and until now so was the only getStats() path in the app: every
+                 * native stats call sat inside the `if (isStreaming)` block below, so after
+                 * stop_stream the monitor's remaining work was getConnectionCount()/getProfile(),
+                 * which count and never reap. A viewer that hung up while the announcement sat idle
+                 * therefore pinned its socket fd, its senderLoop thread and its AsyncPool for the
+                 * life of the announcement — the half-close rule in OMTChannel::receiverLoop keeps
+                 * a peer that closed only its write half marked connected on purpose, so nothing
+                 * else ever notices it is gone. Twenty churns after a stop and the process is
+                 * twenty fds and threads short of a camera it can still open.
+                 *
+                 * The interval is unchanged (1s); this is one extra native call per tick on the
+                 * same thread, and it is what makes the idle announcement as hygienic as a live one.
+                 */
+                omtSender.pollStatsForReaping();
+
                 // Check connection count
                 int count = omtSender.getConnectionCount();
                 if (count != lastCount) {
