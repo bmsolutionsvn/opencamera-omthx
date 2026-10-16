@@ -83,6 +83,12 @@ public class OMTStreamingManager {
     // mDNS and Locks
     private NsdManager nsdManager;
     private NsdManager.RegistrationListener registrationListener;
+    /**
+     * Bumped by every registerService() attempt. An async NsdManager callback belongs to the
+     * attempt that was alive when it was issued, not to whichever announcement happens to exist
+     * when the callback finally lands.
+     */
+    private volatile long registrationGeneration = 0;
     private WifiManager.MulticastLock multicastLock;
     private WifiManager.WifiLock wifiLock;
     private PowerManager.WakeLock wakeLock;
@@ -153,9 +159,7 @@ public class OMTStreamingManager {
                 // way back was killing the process. That is the "sometimes OBS cannot detect the
                 // source" report from the phone's side, and it is unrecoverable by design.
                 Log.e(TAG, "mDNS registration failed - not announcing");
-                omtSender.cleanup();
-                omtSender = null;
-                cleanupAnnouncement();
+                teardownFailedAnnouncement();
                 if (callback != null) {
                     callback.onStreamingError("mDNS registration failed - device is not discoverable");
                 }
@@ -615,7 +619,7 @@ public class OMTStreamingManager {
     /**
      * Cleanup announcement (OMT sender, mDNS, locks).
      */
-    private void cleanupAnnouncement() {
+    private synchronized void cleanupAnnouncement() {
         // Cleanup OMT sender
         if (omtSender != null) {
             omtSender.cleanup();
@@ -623,6 +627,28 @@ public class OMTStreamingManager {
         }
         // Stop background thread
         stopBackgroundThread();
+    }
+
+    /**
+     * Tear down an announcement that never became discoverable: the mDNS registration and the three
+     * locks, then the sender and the monitor thread. This is the path a FAILED registration must
+     * take, sync (registerService returned false, or threw) or async (onRegistrationFailed).
+     *
+     * unregisterService() is the only code that releases the Wi-Fi, wake and multicast locks, and it
+     * is safe to call for a registration mdnsd refused: it gives every resource its own try/catch
+     * and its own null-out, so the IllegalArgumentException NsdManager throws when the registration
+     * callback never fired costs one log line and nothing else — the locks still come back. Skipping
+     * it is what made an async registration failure a permanent leak: the PARTIAL_WAKE_LOCK is
+     * acquired with no timeout, the MulticastLock is reference-counted (so the next attempt's
+     * acquire() could never be matched by the single release()), and the sender keeps port 6400
+     * bound against the retry.
+     *
+     * Synchronized, because it runs on whatever thread NsdManager delivers its callback on, while
+     * start/stopStreaming hold the monitor on the main thread.
+     */
+    private synchronized void teardownFailedAnnouncement() {
+        unregisterService();
+        cleanupAnnouncement();
     }
 
     /**
@@ -642,31 +668,58 @@ public class OMTStreamingManager {
     private boolean registerService(int port, String serviceName) {
         try {
             // 1. Acquire Multicast Lock
+            //
+            // Every lock below is acquired IDEMPOTENTLY: reuse the object the field already holds
+            // and only acquire() it when it is not already held. Overwriting the field is the leak —
+            // the old code created and acquired a fresh MulticastLock on every registerService()
+            // call, so a second announcement while the first was still held pushed that refcounted
+            // lock to count 2 against an object the field no longer named, and the single release()
+            // in unregisterService() could never take it back to 0. Same for the PARTIAL_WAKE_LOCK,
+            // which is acquired with NO timeout at all: one leaked object and the CPU never sleeps
+            // again for the life of the process.
             WifiManager wifiManager = (WifiManager) context.getApplicationContext()
                     .getSystemService(Context.WIFI_SERVICE);
             if (wifiManager != null) {
-                multicastLock = wifiManager.createMulticastLock("OMT_mDNS");
-                multicastLock.setReferenceCounted(true);
-                multicastLock.acquire();
-                Log.i(TAG, "Multicast lock acquired");
+                if (multicastLock == null) {
+                    multicastLock = wifiManager.createMulticastLock("OMT_mDNS");
+                    multicastLock.setReferenceCounted(true);
+                }
+                if (!multicastLock.isHeld()) {
+                    multicastLock.acquire();
+                    Log.i(TAG, "Multicast lock acquired");
+                } else {
+                    Log.i(TAG, "Multicast lock already held — reusing it, not re-acquiring");
+                }
 
                 // 2. Acquire WiFi Lock
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                    wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "OMT_Streaming_Lock");
-                } else {
-                    wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "OMT_Streaming_Lock");
+                if (wifiLock == null) {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "OMT_Streaming_Lock");
+                    } else {
+                        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "OMT_Streaming_Lock");
+                    }
+                    wifiLock.setReferenceCounted(false);
                 }
-                wifiLock.setReferenceCounted(false);
-                wifiLock.acquire();
-                Log.i(TAG, "High-Perf WiFi lock acquired");
+                if (!wifiLock.isHeld()) {
+                    wifiLock.acquire();
+                    Log.i(TAG, "High-Perf WiFi lock acquired");
+                } else {
+                    Log.i(TAG, "WiFi lock already held — reusing it, not re-acquiring");
+                }
             }
 
             // 3. Acquire WakeLock
             PowerManager powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
             if (powerManager != null) {
-                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OMT:StreamingWakeLock");
-                wakeLock.acquire();
-                Log.i(TAG, "CPU WakeLock acquired");
+                if (wakeLock == null) {
+                    wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OMT:StreamingWakeLock");
+                }
+                if (!wakeLock.isHeld()) {
+                    wakeLock.acquire();
+                    Log.i(TAG, "CPU WakeLock acquired");
+                } else {
+                    Log.i(TAG, "CPU WakeLock already held — reusing it, not re-acquiring");
+                }
             }
 
             // 4. Register Service
@@ -675,6 +728,13 @@ public class OMTStreamingManager {
             serviceInfo.setServiceName(serviceName);
             serviceInfo.setServiceType(SERVICE_TYPE);
             serviceInfo.setPort(port);
+
+            /*
+             * Tag this attempt. onRegistrationFailed/onServiceRegistered can land long after the
+             * announcement that caused them was replaced (stop, then a fresh start), and a stale
+             * failure that tears down the CURRENT announcement takes down a working stream.
+             */
+            final long generation = ++registrationGeneration;
 
             registrationListener = new NsdManager.RegistrationListener() {
                 @Override
@@ -685,12 +745,32 @@ public class OMTStreamingManager {
 
                 @Override
                 public void onRegistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {
+                    if (generation != registrationGeneration) {
+                        Log.w(TAG, "Ignoring NSD registration failure (code " + errorCode + ") from a "
+                                + "superseded announcement (gen " + generation + ", current "
+                                + registrationGeneration + ") — tearing down on it would kill a live stream");
+                        return;
+                    }
                     // Async half of registration: NsdManager accepted the call and mdnsd refused it
                     // (duplicate name, malformed label, daemon trouble). Logging a code and moving on
                     // left the UI claiming "discoverable"; tell the user, and clear the flag so
                     // startAnnouncing() will actually try again instead of returning early forever.
                     Log.e(TAG, "NSD Registration failed: " + errorCode);
                     isAnnouncing = false;
+                    /*
+                     * And release what the synchronous half already took. registerService() returns
+                     * true the moment NsdManager ACCEPTS, so by the time this callback fires the
+                     * PARTIAL_WAKE_LOCK (acquired with no timeout), the WifiLock, the refcounted
+                     * MulticastLock and the sender bound to port 6400 are all held. The old body
+                     * cleared the flag and fired the error callback and nothing else: an operator
+                     * saw "device is not discoverable" in the log while `dumpsys power` still
+                     * listed OMT:StreamingWakeLock, the port stayed bound so the next start hit
+                     * EADDRINUSE, and the retry acquired the refcounted multicast lock AGAIN
+                     * against a lock object the field no longer pointed at — permanent, for the life
+                     * of the process. An async failure is the same failure as a sync one and must
+                     * go down the same path.
+                     */
+                    teardownFailedAnnouncement();
                     if (callback != null) {
                         callback.onStreamingError("mDNS registration failed (code " + errorCode +
                                 ") - device is not discoverable");
