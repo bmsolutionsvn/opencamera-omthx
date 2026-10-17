@@ -267,6 +267,35 @@ public class OMTSender {
     }
 
     /**
+     * Frames the camera handed the native encoder ring since the sender was created — the total the
+     * other three ring numbers are measured against. Reported straight from its own counter, never
+     * computed from the others, so a frame lost on a path nobody counts cannot be hidden by
+     * arithmetic that agrees with itself.
+     */
+    public long getRingAdmitted() {
+        return isInitialized ? nativeGetRingAdmitted() : 0;
+    }
+
+    /** Frames the encoder thread packed and posted to the sender since the sender was created. */
+    public long getRingDelivered() {
+        return isInitialized ? nativeGetRingDelivered() : 0;
+    }
+
+    /**
+     * Frames the ring admitted and then threw away on the ENCODER side: no sender left to post to,
+     * a geometry no NV12 buffer could be sized for, or a pack the packer refused.
+     *
+     * These are neither delivered nor dropped — {@link #getRingDrops()} counts ring EVICTIONS only —
+     * so before this getter existed they were invisible in every tally, and a device whose HAL
+     * reported an unpackable geometry looked like a stream that was simply idle. Read it next to
+     * {@link #getRingAdmitted()}: the four ring numbers must account for every frame the camera gave
+     * us, and this is the one that used to disappear.
+     */
+    public long getRingRefused() {
+        return isInitialized ? nativeGetRingRefused() : 0;
+    }
+
+    /**
      * Get the number of currently connected receivers.
      */
     public int getConnectionCount() {
@@ -319,6 +348,25 @@ public class OMTSender {
      * Get total frames sent since initialization.
      */
     public long getFramesSent() {
+        return isInitialized ? nativeGetFramesSent() : 0;
+    }
+
+    /**
+     * Touch the native sender's statistics path once, from a thread that is not sending.
+     *
+     * The number is incidental — this call exists for what it triggers on the way in.
+     * {@code Sender::getStats()} is one of only two places that run {@code cleanupDisconnected()},
+     * the reap that unlinks a channel whose receiver has gone; the other is {@code Sender::send()},
+     * which stops running the instant the camera frames stop. {@link #getConnectionCount()} counts
+     * and does NOT reap, so an idle announcement (streaming stopped, mDNS still up, a viewer that
+     * has hung up) kept that viewer's socket fd, its senderLoop thread and its AsyncPool for the
+     * rest of the announcement's life — the OMTChannel half-close rule deliberately keeps a peer
+     * that closed only its write half marked connected, so nothing else ever notices it is gone.
+     *
+     * Cheapest existing path to that reap: one {@code getStats()} through the frame-sent getter. No
+     * C++ reaping semantics are changed or duplicated here.
+     */
+    public long pollStatsForReaping() {
         return isInitialized ? nativeGetFramesSent() : 0;
     }
 
@@ -377,6 +425,12 @@ public class OMTSender {
                                                   int width, int height);
 
     private native long nativeGetRingDrops();
+
+    private native long nativeGetRingAdmitted();
+
+    private native long nativeGetRingDelivered();
+
+    private native long nativeGetRingRefused();
 
     private native int nativeGetConnectionCount();
 

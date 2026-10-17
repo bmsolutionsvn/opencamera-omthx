@@ -2344,10 +2344,32 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         Intent intent = getIntent();
         if (intent == null || intent.getExtras() == null)
             return;
-        OmtDebugCommands.Command cmd =
-                OmtDebugCommands.parse(intent.getExtras().getString(OmtDebugCommands.EXTRA_COMMAND));
+        String raw = intent.getExtras().getString(OmtDebugCommands.EXTRA_COMMAND);
+        OmtDebugCommands.Command cmd = OmtDebugCommands.parse(raw);
         if (cmd == null)
             return; // no command (normal launch) — stay completely out of the way
+        /*
+         * CONSUME the extra here, on BOTH paths that reach this method (onCreate and
+         * onNewIntent/setIntent both read getIntent(), so this one call site covers both), and
+         * before the debuggable gate below — a release build that logs and ignores a command must
+         * still not carry it forward.
+         *
+         * What the old code looked like to a user: getIntent() returns the same Intent the system
+         * keeps for the activity, so an extra that is only ever READ survives recreate() — the
+         * Camera2 auto-switch inside startOmtStreaming() does exactly that, and so does a rotation
+         * or a dark-mode toggle. A stop_stream issued over adb an hour earlier came back as a
+         * standing order: the next recreation replayed it and silently stopped the stream the user
+         * had just started by hand, with the only clue in the log ("command accepted:
+         * STOP_STREAM" at a moment nobody pressed anything). Forcing the process down was the only
+         * way to clear it. See OmtDebugCommands.isConsumableCommand for the rule; removeExtra
+         * itself needs a real Intent, so the replay regression is proven by the emulator battery's
+         * S2 (a genuine recreation via `cmd uimode night`), not by a JVM test.
+         */
+        if (OmtDebugCommands.isConsumableCommand(raw)) {
+            intent.removeExtra(OmtDebugCommands.EXTRA_COMMAND);
+            if (MyDebug.LOG)
+                Log.d("OmtDebug", "command extra consumed — it cannot replay on recreation");
+        }
         if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) == 0) {
             Log.w("OmtDebug", "command '" + cmd + "' ignored: not a debuggable build");
             return;
@@ -2374,9 +2396,16 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             // "OMTStreamingManager: Starting OMT streaming: 0x0@30fps" and a stream that
             // announces but carries 0 video. The on-screen button can't be pressed that early,
             // which is why this never bit real users. Wait for a non-zero profile too.
+            // The readiness gate belongs to START_STREAM ONLY. stop_stream and status touch no
+            // camera state — and gating them made them silently die whenever the activity is not
+            // in the foreground: on the phone, backgrounding the app pauses the camera, the video
+            // profile drops to 0x0, and a stop_stream issued then hit the 30s cap unexecuted
+            // (measured on RMX3867: "command accepted: STATUS", no "executing" line, ever). The
+            // operator loses the stop button exactly when the app slipped out of the foreground.
             VideoProfile vp = (preview == null) ? null : preview.getVideoProfile();
-            boolean ready = preview != null && !preview.isOpeningCamera()
-                    && vp != null && vp.videoFrameWidth > 0 && vp.videoFrameHeight > 0;
+            boolean ready = pendingOmtDebug != OmtDebugCommands.Command.START_STREAM
+                    || (preview != null && !preview.isOpeningCamera()
+                        && vp != null && vp.videoFrameWidth > 0 && vp.videoFrameHeight > 0);
             if (!ready) {
                 if (++omtDebugTicks >= 60) {
                     Log.e("OmtDebug", "camera not ready after 30s — command " + pendingOmtDebug
@@ -2407,8 +2436,24 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
                         Log.i("OmtDebug", "not streaming — stop skipped");
                     break;
                 case STATUS:
+                    /*
+                     * The four ring counters, each read from its own atomic: admitted is the total the
+                     * other three are measured against and is never computed from them — arithmetic
+                     * that agrees with itself is exactly how the refused frames stayed hidden. They
+                     * were incremented on three encoder-side refusal paths (sender gone, unsizeable
+                     * buffer, packer refusal) with no getter at all, so a frame that was neither
+                     * delivered nor dropped — the eviction counter only covers evictions — vanished
+                     * from every tally, and a device whose HAL reported an unpackable geometry looked
+                     * to whoever was reading the log like a stream that was simply idle.
+                     */
+                    long[] ring = (omtStreamingManager != null)
+                            ? omtStreamingManager.getRingAccounting() : new long[4];
                     Log.i("OmtDebug", "status: streaming=" + streaming
-                            + " announcing=" + (omtStreamingManager != null && omtStreamingManager.isAnnouncing()));
+                            + " announcing=" + (omtStreamingManager != null && omtStreamingManager.isAnnouncing())
+                            + " | ring admitted=" + ring[0]
+                            + " delivered=" + ring[1]
+                            + " dropped=" + ring[2]
+                            + " refused=" + ring[3]);
                     break;
             }
         }
@@ -3655,12 +3700,14 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
                 case PreferenceKeys.OmtStreamingQualityKey:
                     if (omtStreamingManager != null && omtStreamingManager.isStreaming()) {
                         try {
-                            // Read it the same way everybody else does. This site defaulted to
+                            // Read it the same way everybody else does. This site once defaulted to
                             // "50" (MEDIUM) while MyApplicationInterface.getOmtStreamingQuality()
-                            // defaults to "1" (LOW), so with the preference never touched the
+                            // defaulted to "1" (LOW), so with the preference never touched the
                             // announcement started at LOW and the first live change jumped the
                             // encoder to ~100 Mbps — a 2.3x bitrate spike on Wi-Fi, which is exactly
                             // the congestion that makes a stream look "unstable compared to NDI".
+                            // That is why there is one reader here and why the XML default and the
+                            // Java default are the same value (Auto) — see getOmtStreamingQuality.
                             int quality = applicationInterface.getOmtStreamingQuality();
                             omtStreamingManager.setQuality(quality);
                             if (MyDebug.LOG)

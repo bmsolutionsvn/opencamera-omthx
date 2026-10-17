@@ -1199,13 +1199,21 @@ public class MyApplicationInterface extends BasicApplicationInterface {
 
     /**
      * Get OMT streaming quality setting.
-     * 
-     * @return Quality value: 1=Low, 50=Medium, 100=High
+     *
+     * The default is AUTO (0), the receiver-suggested path: a viewer asks for Low or High in its
+     * OMTSettings and the encoder follows (Sender::onQualityChanged only acts while the quality is
+     * Default). Defaulting to LOW (1) made that whole path dead code — every fresh install streamed
+     * at a fixed ~43 Mbps and a receiver asking for High was never heard, so "give me a sharper
+     * picture" had no effect until the user went into settings by hand. The ListPreference's
+     * android:defaultValue in res/xml/preferences_sub_video.xml is the same value; the two must not
+     * drift apart again (see the 50-vs-1 spike this method's comment history already records).
+     *
+     * @return Quality value: 0=Auto (receiver-suggested), 1=Low, 50=Medium, 100=High
      */
     public int getOmtStreamingQuality() {
-        // Default to LOW (1) for better compatibility with all devices and networks
+        // Default to AUTO (0): the receiver decides, see above.
         // LOW: ~43 Mbps, MEDIUM: ~100 Mbps, HIGH: ~130 Mbps (at 1080p30)
-        String value = sharedPreferences.getString(PreferenceKeys.OmtStreamingQualityKey, "1");
+        String value = sharedPreferences.getString(PreferenceKeys.OmtStreamingQualityKey, "0");
         if (MyDebug.LOG)
             Log.d("OMTQuality", "getOmtStreamingQuality: raw value from prefs = '" + value + "'");
         try {
@@ -1214,9 +1222,11 @@ public class MyApplicationInterface extends BasicApplicationInterface {
                 Log.d("OMTQuality", "getOmtStreamingQuality: returning " + quality);
             return quality;
         } catch (NumberFormatException e) {
+            // A value that is not a number at all is not a choice anybody made, so honour the
+            // default rather than guessing at a fixed bitrate — same reason the default is Auto.
             if (MyDebug.LOG)
-                Log.e("OMTQuality", "getOmtStreamingQuality: parse error, returning default 1");
-            return 1; // Default to LOW for stability
+                Log.e("OMTQuality", "getOmtStreamingQuality: parse error, returning default 0 (Auto)");
+            return OMTSender.QUALITY_DEFAULT; // Auto: the receiver suggests the quality
         }
     }
 

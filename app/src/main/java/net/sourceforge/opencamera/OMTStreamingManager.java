@@ -83,6 +83,12 @@ public class OMTStreamingManager {
     // mDNS and Locks
     private NsdManager nsdManager;
     private NsdManager.RegistrationListener registrationListener;
+    /**
+     * Bumped by every registerService() attempt. An async NsdManager callback belongs to the
+     * attempt that was alive when it was issued, not to whichever announcement happens to exist
+     * when the callback finally lands.
+     */
+    private volatile long registrationGeneration = 0;
     private WifiManager.MulticastLock multicastLock;
     private WifiManager.WifiLock wifiLock;
     private PowerManager.WakeLock wakeLock;
@@ -153,9 +159,7 @@ public class OMTStreamingManager {
                 // way back was killing the process. That is the "sometimes OBS cannot detect the
                 // source" report from the phone's side, and it is unrecoverable by design.
                 Log.e(TAG, "mDNS registration failed - not announcing");
-                omtSender.cleanup();
-                omtSender = null;
-                cleanupAnnouncement();
+                teardownFailedAnnouncement();
                 if (callback != null) {
                     callback.onStreamingError("mDNS registration failed - device is not discoverable");
                 }
@@ -312,6 +316,21 @@ public class OMTStreamingManager {
     }
 
     /**
+     * The native encoder ring's own accounting, for the debug `status` command, in this order:
+     * admitted, delivered, dropped (ring evictions), refused (encoder-side losses). All four are
+     * read straight from their own counters — admitted is NOT computed from the other three, because
+     * arithmetic that agrees with itself is exactly how a frame lost on an uncounted path stays
+     * hidden. Zero across the board when no sender exists.
+     */
+    public long[] getRingAccounting() {
+        if (omtSender == null) {
+            return new long[] { 0, 0, 0, 0 };
+        }
+        return new long[] { omtSender.getRingAdmitted(), omtSender.getRingDelivered(),
+                omtSender.getRingDrops(), omtSender.getRingRefused() };
+    }
+
+    /**
      * Get the current VMX profile ID.
      */
     public int getProfile() {
@@ -339,16 +358,18 @@ public class OMTStreamingManager {
 
             if (!isStreaming || omtSender == null) {
                 // Drain the queue to prevent backpressure
-                Image image = reader.acquireLatestImage();
+                Image image = acquireLatestQuietly(reader, "drain");
                 if (image != null) {
                     image.close();
                 }
                 return;
             }
 
-            Image image = reader.acquireLatestImage();
+            Image image = acquireLatestQuietly(reader, "send");
             if (image == null) {
-                Log.w(TAG, "acquireLatestImage returned null");
+                // Either nothing was pending or the reader was closed underneath us — the second
+                // case is already counted and logged by acquireLatestQuietly. Neither is a frame.
+                if (DEBUG_LOGS) Log.d(TAG, "acquireLatestImage returned null");
                 return;
             }
 
@@ -359,6 +380,37 @@ public class OMTStreamingManager {
             }
         }
     };
+
+    /** How many times a callback fired against an already-closed ImageReader. */
+    private int acquireOnClosedReaderCount = 0;
+
+    /**
+     * acquireLatestImage(), for a reader that another thread may be closing right now.
+     *
+     * The old code called reader.acquireLatestImage() bare, twice, outside any try — the only
+     * guard in the callback wrapped sendFrame(), not the acquire — and cleanupStreaming() closes
+     * the reader from the main thread (stopStreaming()/stopAll())
+     * while these callbacks dispatch on the OMTStreamingThread HandlerThread. A callback already
+     * queued when stop arrived, or one already in flight, then threw IllegalStateException("Image
+     * Reader is not prepared") from a HandlerThread with no catch anywhere above it: logcat showed
+     * the F DEBUG tombstone and the whole camera app vanished mid-stream. To a user that is "the
+     * camera crashed the second I pressed stop", and it reproduced on a cycle (see the emulator
+     * battery's S13, 20 start/stop cycles). A refused late frame is a dropped frame; an uncaught
+     * exception in a callback is a dead process.
+     */
+    private Image acquireLatestQuietly(ImageReader reader, String where) {
+        try {
+            return reader.acquireLatestImage();
+        } catch (IllegalStateException e) {
+            acquireOnClosedReaderCount++;
+            if (acquireOnClosedReaderCount <= 3 || (DEBUG_LOGS && acquireOnClosedReaderCount % 30 == 0)) {
+                Log.w(TAG, where + ": acquireLatestImage on an ImageReader that was already closed ("
+                        + acquireOnClosedReaderCount + " time(s)) — a queued callback lost the race "
+                        + "with cleanupStreaming(); the frame is dropped, the process stays up");
+            }
+            return null;
+        }
+    }
 
     private int sentFrameCount = 0;
     private int sendFailureCount = 0;
@@ -491,6 +543,27 @@ public class OMTStreamingManager {
                     return;
                 }
 
+                /*
+                 * Reap the subscribers that are gone — every tick, whether or not frames are
+                 * flowing.
+                 *
+                 * The only code that unlinks a dead channel is cleanupDisconnected(), and it runs
+                 * from Sender::send() and Sender::getStats(). send() is dead the moment the camera
+                 * frames stop, and until now so was the only getStats() path in the app: every
+                 * native stats call sat inside the `if (isStreaming)` block below, so after
+                 * stop_stream the monitor's remaining work was getConnectionCount()/getProfile(),
+                 * which count and never reap. A viewer that hung up while the announcement sat idle
+                 * therefore pinned its socket fd, its senderLoop thread and its AsyncPool for the
+                 * life of the announcement — the half-close rule in OMTChannel::receiverLoop keeps
+                 * a peer that closed only its write half marked connected on purpose, so nothing
+                 * else ever notices it is gone. Twenty churns after a stop and the process is
+                 * twenty fds and threads short of a camera it can still open.
+                 *
+                 * The interval is unchanged (1s); this is one extra native call per tick on the
+                 * same thread, and it is what makes the idle announcement as hygienic as a live one.
+                 */
+                omtSender.pollStatsForReaping();
+
                 // Check connection count
                 int count = omtSender.getConnectionCount();
                 if (count != lastCount) {
@@ -548,10 +621,66 @@ public class OMTStreamingManager {
      * Cleanup streaming only (ImageReader), keep OMT sender and mDNS active.
      */
     private void cleanupStreaming() {
-        // Release ImageReader only
-        if (imageReader != null) {
-            imageReader.close();
-            imageReader = null;
+        // Release ImageReader only.
+        //
+        // THE FAILURE THIS PREVENTS. The reader used to be closed right here, on the main thread,
+        // while these callbacks dispatch on the OMTStreamingThread HandlerThread. A callback already
+        // in flight when stop arrived was inside nativeQueueFramePlanes copying the plane bytes the
+        // Image points at; ImageReader.close() frees those buffers underneath it, and the memcpy
+        // walked off unmapped memory. Measured on the emulator, twice in one battery run, ~20 ms
+        // after "Stopping all OMT services":
+        //
+        //   F libc: Fatal signal 11 (SIGSEGV), code 1 (SEGV_MAPERR) in tid (OMTStreamingThr)
+        //   #00 libc.so (memcpy+953)
+        //   #03 libomtbridge.so (Java_net_sourceforge_opencamera_OMTSender_nativeQueueFramePlanes+869)
+        //   #10 OMTSender.queueFramePlanes   #16 OMTStreamingManager.sendFrame
+        //   #28 OMTStreamingManager$1.onImageAvailable   #34 ImageReader$1.run
+        //
+        // That is a process death no Java catch can reach — the acquire guard below catches
+        // IllegalStateException, not SIGSEGV — and it is what the emulator battery's S13 (20
+        // start/stop cycles) is red on. The only fix is ORDERING: the close has to run on the same
+        // looper as the callbacks, so it cannot begin until the callback in flight has returned.
+        // Hence posting the release to backgroundHandler instead of doing it here, and running it
+        // inline only when there is no handler left to post to. This is also why stopBackgroundThread
+        // uses quitSafely(): a queued release still runs while the looper drains.
+        //
+        // Each step keeps its own try/catch and the field is nulled first, mirroring the per-resource
+        // discipline unregisterService() documents: one step throwing must not jump the rest, and
+        // getStreamingSurface() must never hand out a Surface whose reader is being torn down.
+        final ImageReader reader = imageReader;
+        if (reader == null) {
+            return;
+        }
+        imageReader = null;
+        final Runnable release = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    // Detach first: no new callback may be scheduled against a reader about to die.
+                    reader.setOnImageAvailableListener(null, null);
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to detach the ImageReader listener", e);
+                }
+                try {
+                    reader.close();
+                } catch (Exception e) {
+                    Log.e(TAG, "Failed to close the ImageReader", e);
+                }
+            }
+        };
+        final Handler handler = backgroundHandler;
+        boolean handedToCallbackThread = false;
+        if (handler != null) {
+            try {
+                handedToCallbackThread = handler.post(release);
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to post the ImageReader release to the callback thread", e);
+            }
+        }
+        if (!handedToCallbackThread) {
+            // No background looper to serialize with (never started, or already quit). Nothing is
+            // dispatching on it, so releasing here cannot race a callback.
+            release.run();
         }
         // The packed-frame buffers live in the native ring now, and the encoder thread that owns
         // them is stopped and joined by OMTSender.cleanup() -> nativeCleanup, which drains what the
@@ -561,7 +690,7 @@ public class OMTStreamingManager {
     /**
      * Cleanup announcement (OMT sender, mDNS, locks).
      */
-    private void cleanupAnnouncement() {
+    private synchronized void cleanupAnnouncement() {
         // Cleanup OMT sender
         if (omtSender != null) {
             omtSender.cleanup();
@@ -569,6 +698,28 @@ public class OMTStreamingManager {
         }
         // Stop background thread
         stopBackgroundThread();
+    }
+
+    /**
+     * Tear down an announcement that never became discoverable: the mDNS registration and the three
+     * locks, then the sender and the monitor thread. This is the path a FAILED registration must
+     * take, sync (registerService returned false, or threw) or async (onRegistrationFailed).
+     *
+     * unregisterService() is the only code that releases the Wi-Fi, wake and multicast locks, and it
+     * is safe to call for a registration mdnsd refused: it gives every resource its own try/catch
+     * and its own null-out, so the IllegalArgumentException NsdManager throws when the registration
+     * callback never fired costs one log line and nothing else — the locks still come back. Skipping
+     * it is what made an async registration failure a permanent leak: the PARTIAL_WAKE_LOCK is
+     * acquired with no timeout, the MulticastLock is reference-counted (so the next attempt's
+     * acquire() could never be matched by the single release()), and the sender keeps port 6400
+     * bound against the retry.
+     *
+     * Synchronized, because it runs on whatever thread NsdManager delivers its callback on, while
+     * start/stopStreaming hold the monitor on the main thread.
+     */
+    private synchronized void teardownFailedAnnouncement() {
+        unregisterService();
+        cleanupAnnouncement();
     }
 
     /**
@@ -588,31 +739,58 @@ public class OMTStreamingManager {
     private boolean registerService(int port, String serviceName) {
         try {
             // 1. Acquire Multicast Lock
+            //
+            // Every lock below is acquired IDEMPOTENTLY: reuse the object the field already holds
+            // and only acquire() it when it is not already held. Overwriting the field is the leak —
+            // the old code created and acquired a fresh MulticastLock on every registerService()
+            // call, so a second announcement while the first was still held pushed that refcounted
+            // lock to count 2 against an object the field no longer named, and the single release()
+            // in unregisterService() could never take it back to 0. Same for the PARTIAL_WAKE_LOCK,
+            // which is acquired with NO timeout at all: one leaked object and the CPU never sleeps
+            // again for the life of the process.
             WifiManager wifiManager = (WifiManager) context.getApplicationContext()
                     .getSystemService(Context.WIFI_SERVICE);
             if (wifiManager != null) {
-                multicastLock = wifiManager.createMulticastLock("OMT_mDNS");
-                multicastLock.setReferenceCounted(true);
-                multicastLock.acquire();
-                Log.i(TAG, "Multicast lock acquired");
+                if (multicastLock == null) {
+                    multicastLock = wifiManager.createMulticastLock("OMT_mDNS");
+                    multicastLock.setReferenceCounted(true);
+                }
+                if (!multicastLock.isHeld()) {
+                    multicastLock.acquire();
+                    Log.i(TAG, "Multicast lock acquired");
+                } else {
+                    Log.i(TAG, "Multicast lock already held — reusing it, not re-acquiring");
+                }
 
                 // 2. Acquire WiFi Lock
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
-                    wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "OMT_Streaming_Lock");
-                } else {
-                    wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "OMT_Streaming_Lock");
+                if (wifiLock == null) {
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+                        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "OMT_Streaming_Lock");
+                    } else {
+                        wifiLock = wifiManager.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "OMT_Streaming_Lock");
+                    }
+                    wifiLock.setReferenceCounted(false);
                 }
-                wifiLock.setReferenceCounted(false);
-                wifiLock.acquire();
-                Log.i(TAG, "High-Perf WiFi lock acquired");
+                if (!wifiLock.isHeld()) {
+                    wifiLock.acquire();
+                    Log.i(TAG, "High-Perf WiFi lock acquired");
+                } else {
+                    Log.i(TAG, "WiFi lock already held — reusing it, not re-acquiring");
+                }
             }
 
             // 3. Acquire WakeLock
             PowerManager powerManager = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
             if (powerManager != null) {
-                wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OMT:StreamingWakeLock");
-                wakeLock.acquire();
-                Log.i(TAG, "CPU WakeLock acquired");
+                if (wakeLock == null) {
+                    wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "OMT:StreamingWakeLock");
+                }
+                if (!wakeLock.isHeld()) {
+                    wakeLock.acquire();
+                    Log.i(TAG, "CPU WakeLock acquired");
+                } else {
+                    Log.i(TAG, "CPU WakeLock already held — reusing it, not re-acquiring");
+                }
             }
 
             // 4. Register Service
@@ -621,6 +799,13 @@ public class OMTStreamingManager {
             serviceInfo.setServiceName(serviceName);
             serviceInfo.setServiceType(SERVICE_TYPE);
             serviceInfo.setPort(port);
+
+            /*
+             * Tag this attempt. onRegistrationFailed/onServiceRegistered can land long after the
+             * announcement that caused them was replaced (stop, then a fresh start), and a stale
+             * failure that tears down the CURRENT announcement takes down a working stream.
+             */
+            final long generation = ++registrationGeneration;
 
             registrationListener = new NsdManager.RegistrationListener() {
                 @Override
@@ -631,12 +816,32 @@ public class OMTStreamingManager {
 
                 @Override
                 public void onRegistrationFailed(NsdServiceInfo serviceInfo, int errorCode) {
+                    if (generation != registrationGeneration) {
+                        Log.w(TAG, "Ignoring NSD registration failure (code " + errorCode + ") from a "
+                                + "superseded announcement (gen " + generation + ", current "
+                                + registrationGeneration + ") — tearing down on it would kill a live stream");
+                        return;
+                    }
                     // Async half of registration: NsdManager accepted the call and mdnsd refused it
                     // (duplicate name, malformed label, daemon trouble). Logging a code and moving on
                     // left the UI claiming "discoverable"; tell the user, and clear the flag so
                     // startAnnouncing() will actually try again instead of returning early forever.
                     Log.e(TAG, "NSD Registration failed: " + errorCode);
                     isAnnouncing = false;
+                    /*
+                     * And release what the synchronous half already took. registerService() returns
+                     * true the moment NsdManager ACCEPTS, so by the time this callback fires the
+                     * PARTIAL_WAKE_LOCK (acquired with no timeout), the WifiLock, the refcounted
+                     * MulticastLock and the sender bound to port 6400 are all held. The old body
+                     * cleared the flag and fired the error callback and nothing else: an operator
+                     * saw "device is not discoverable" in the log while `dumpsys power` still
+                     * listed OMT:StreamingWakeLock, the port stayed bound so the next start hit
+                     * EADDRINUSE, and the retry acquired the refcounted multicast lock AGAIN
+                     * against a lock object the field no longer pointed at — permanent, for the life
+                     * of the process. An async failure is the same failure as a sync one and must
+                     * go down the same path.
+                     */
+                    teardownFailedAnnouncement();
                     if (callback != null) {
                         callback.onStreamingError("mDNS registration failed (code " + errorCode +
                                 ") - device is not discoverable");
