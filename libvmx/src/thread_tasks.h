@@ -31,10 +31,13 @@
 #include <functional>
 
 // Build marker for QA (skill opencamera-omt-android, rule 4: "verify the native lib was really
-// rebuilt"). `strings libvmx.so | grep vmx-thread-task-predicate-wait` is how the APK build proves
+// rebuilt"). `strings libvmx.so | grep vmx-thread-task` is how the APK build proves
 // the NDK compiled this header into the shipped library rather than reusing a stale object file.
 // File scope, not a struct member: an in-class `static` with an initialiser is a declaration.
-__attribute__((used)) static const char VMX_ThreadTaskBuildTag[] = "vmx-thread-task-predicate-wait-p0-11";
+// p0-12: the VMX_Create worker-thread cap (min(VMX_BITRATE_TABLE value, CPUs this process may
+// really run on)). Bumped because that change lives in vmxcodec.cpp, which this header is pulled
+// into — so a libvmx.so that still says p0-11 was linked from stale objects.
+__attribute__((used)) static const char VMX_ThreadTaskBuildTag[] = "vmx-thread-task-predicate-wait-p0-12-threadcap";
 
 struct ThreadTask
 {

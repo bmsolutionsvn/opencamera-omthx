@@ -22,13 +22,24 @@
  */
 #include "vmxcodec.h"
 
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 namespace qa_stub {
     int failWidth = 0, failHeight = 0;   // the size VMX_Create must refuse; 0/0 = never
     int payloadBytes = 4096;             // what VMX_SaveTo claims to have written; <= 0 = nothing
     int createCalls = 0, destroyCalls = 0, encodeCalls = 0, saveCalls = 0;
+
+    /* How long an encode takes, in microseconds. Default 0: every scenario that uses this file as a
+     * RECORDER (encoder-create-failure, wire-declaration) wants it instant. qa/encode-pipeline.cpp
+     * sets 70 ms, which is the whole point of that scenario: the only way to prove an ImageReader
+     * callback does not wait for the codec is to make the codec slow enough to notice, on a host
+     * with no camera and no phone. It sleeps inside VMX_Encode* — i.e. exactly where the real codec
+     * pushes its slice ranges and Joins them all (libvmx/src/vmxcodec.cpp:~1700) — so the wait lands
+     * on whatever thread called encode, which is the thread under test. */
+    int encodeDelayUs = 0;
 
     // Every create, in order, with the arguments the sender actually passed.
     struct Create { int width, height, profile, colorSpace; };
@@ -42,6 +53,7 @@ namespace qa_stub {
     void reset() {
         failWidth = failHeight = 0;
         payloadBytes = 4096;
+        encodeDelayUs = 0;
         createCalls = destroyCalls = encodeCalls = saveCalls = 0;
         createRecords = 0;
         std::memset(creates, 0, sizeof(creates));
@@ -75,7 +87,16 @@ VMX_API void VMX_Destroy(VMX_INSTANCE* instance) {
     std::free(instance);
 }
 
-static VMX_ERR stub_encode() { ++qa_stub::encodeCalls; return VMX_ERR_OK; }
+static VMX_ERR stub_encode() {
+    ++qa_stub::encodeCalls;
+    // The slow-encode seam: this is the call Sender::encodeFrame() makes on the thread that asked
+    // for the frame, and it is where the real codec spends its time (Push the slice ranges, then
+    // Join every one of them). qa/encode-pipeline.cpp turns it into 70 ms and then asks whether the
+    // thread that produced the frame noticed.
+    if (qa_stub::encodeDelayUs > 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(qa_stub::encodeDelayUs));
+    return VMX_ERR_OK;
+}
 
 VMX_API VMX_ERR VMX_EncodeBGRA(VMX_INSTANCE*, BYTE*, int, int) { return stub_encode(); }
 VMX_API VMX_ERR VMX_EncodeBGRX(VMX_INSTANCE*, BYTE*, int, int) { return stub_encode(); }

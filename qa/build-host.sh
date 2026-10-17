@@ -1605,6 +1605,339 @@ PY
 then build_and_run_channel hp-mutant-select "$ROOT/qa/receiver-high-fd.cpp" "$M_HP1" fail
 fi
 
+# ---------------------------------------------------------------------------
+# vmx-thread-cap (tc-*): the codec may only fan its slice tasks out to cpus this process can run on.
+#
+# THE FAILURE. VMX_EncodePlanes (libvmx/src/vmxcodec.cpp:~1700) pushes one slice range per thread and
+# then Joins EVERY one of them, so a frame is not done until its slowest slice is. The thread count
+# comes from VMX_BITRATE_TABLE and is then overridden to 8 or 16 for 2160p/4320p whenever
+# std::thread::hardware_concurrency() reports that many cpus — a number that counts every ONLINE cpu,
+# not the ones this process may run on. On an 8-core big.LITTLE phone (or inside a 4-cpu cpuset, which
+# is what a host can actually reproduce today) that is two rounds of scheduling per frame with Join
+# holding the whole frame open while the last slice waits for a core somebody else is using.
+#
+# WHAT IS PROVEN HERE, and what is not: the cap, the >=1 clamp that keeps `totalSlices / numThreads`
+# from being a SIGFPE, and — the case that says the cap is a scheduling decision and nothing more —
+# that the same 1080p frame encodes to the SAME BYTES at 1, 2, 4, 8 and 16 worker threads. The
+# phone's big.LITTLE case is UNPROVEN on this bench because the phone is not on this bench; the
+# commit that lands it says so.
+#
+# The controls run under `taskset -c 0-3` deliberately: hardware_concurrency() answers 32 there too
+# (measured — it reads the online count, not the affinity mask), so an unconstrained run cannot tell
+# the capped codec from the uncapped one. Running the must-fail control on the whole machine would
+# have produced a green "anti-vacuity" control, which is the worst thing a suite can do.
+# ---------------------------------------------------------------------------
+
+# The pre-cap codec, pinned to the immutable commit this branch sits on — VMX_Create AND
+# thread_tasks.h from the same rev, because the build tag in that header moved with this change and
+# a copy mixed with the tree's header is not the tree this control claims to run.
+TC_PREFIX_REV=${TC_PREFIX_REV:-9c0820668b39353b999850b2884dca2d05083b40}
+
+# compile_tc <name> <vmx-src-dir> — build the scenario over a chosen copy of the codec, do not score
+# it. The constrained scenarios below run the SAME binary behind a CPU mask and score it under their
+# own name, so building and scoring have to be separable; a scenario that was never compiled is not
+# a red scenario, it is an absent one, and score_run_under says so as a harness error.
+compile_tc() {
+  local name=$1 vmxdir=$2
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS -I"$vmxdir" $INC "$ROOT/qa/vmx-thread-cap.cpp" \
+       "$vmxdir/vmxcodec.cpp" "$vmxdir/vmxcodec_x86.cpp" "$vmxdir/vmxcodec_avx2.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -15
+    FAILED+=("$name(build-failed)"); rc=1; return 1
+  fi
+  return 0
+}
+
+# build_tc <name> <expect pass|fail> <vmx-src-dir> — compile, then score on the whole machine.
+build_tc() {
+  local name=$1 expect=$2 vmxdir=$3
+  compile_tc "$name" "$vmxdir" || return
+  score_run "$name" "$expect"
+}
+
+# score_tc <name> <expect> — score_run, but only for a binary that EXISTS.
+#
+# WHY THIS EXISTS: tc-mutant-threads-999 came back "fail as expected" from a run that never happened.
+# `timeout` had nothing to execute and printed "timeout: failed to run command ...: No such file or
+# directory" into the run log; score_run's absent-run guard asks for EMPTY output, and this output was
+# not empty, so a control nobody compiled was scored as a mutant the gate caught. That is the exact
+# inversion this suite is built to prevent — an absent control looks identical to a passing one in the
+# summary line, and here it even looked like the right colour. A scenario binary that is not there is a
+# harness error, in this section, always; the check lives here rather than in master's score_run
+# because the harness outside this section has to stay byte-for-byte what it was.
+score_tc() {
+  local name=$1 expect=$2
+  [ -x "$SCRATCH/$name" ] \
+    || harness_die "score_tc $name: no such scenario binary $SCRATCH/$name — it was never compiled, and scoring its absence would report an absent control as a caught one"
+  score_run "$name" "$expect"
+}
+
+# score_run_under <name> <expect> <binary-name> <command...> — the same verdict, run behind a
+# command prefix, and scored under its OWN scenario name. The constrained run below is the same
+# program on a smaller CPU budget: it is a different scenario, so it gets a different name and a
+# different run.log, and it must not be scored twice under the unrestricted one's name. taskset is
+# not optional here: a missing one is a harness error, never a silently skipped control (a control
+# nobody ran is not evidence, and it looks exactly like a control that passed).
+score_run_under() {
+  local name=$1 expect=$2 binary=$3; shift 3
+  [ -x "$SCRATCH/$binary" ] \
+    || harness_die "score_run_under $name: no such scenario binary $SCRATCH/$binary — the constrained run cannot be expressed"
+  command -v "$1" >/dev/null 2>&1 \
+    || harness_die "score_run_under $name: '$1' is not available — the constrained run cannot be expressed, and skipping it would score an absent control"
+  timeout 180 "$@" "$SCRATCH/$binary" >"$SCRATCH/$name.run.log" 2>&1
+  local status=$?
+  local got=fail
+  [ "$status" -eq 0 ] && got=pass
+  if [ "$got" = "$expect" ]; then
+    echo "  $name: $got as expected"
+  else
+    echo "  $name: $got but expected $expect  <-- PROBLEM"
+    sed 's/^/      /' "$SCRATCH/$name.run.log" | tail -18
+    FAILED+=("$name(verdict-$got)"); rc=1
+  fi
+}
+
+echo "== vmx-thread-cap: the codec may only fan out to cpus this process can run on =="
+build_tc tc-fixed pass "$ROOT/libvmx/src"
+# The same program on a 4-CPU budget, scored as its own scenario. This is the run the cap is FOR:
+# 2160p must come up with 4 slice threads, not the 8 the override asks for, and 4320p with 4, not 16.
+# It deliberately has no binary of its own — it IS tc-fixed, behind a mask — so qa/repeat-run.sh
+# measures its determinism as `repeat-run.sh $SCRATCH tc-fixed pass 5`: the binary is the same one,
+# and a CPU mask that does not vary between runs adds no nondeterminism of its own to re-measure.
+# (Copying the binary under this scenario's name would have made repeat-run able to target it, and
+# it would have silently re-run it UNCONSTRAINED — a scenario that changes meaning depending on who
+# launched it is worse than one repeat-run cannot reach.)
+score_run_under tc-fixed-constrained pass tc-fixed taskset -c 0-3
+
+PFTC="$SCRATCH/vmx-prefix-threadcap"; rm -rf "$PFTC"; mkdir -p "$PFTC"
+cp "$ROOT"/libvmx/src/*.cpp "$ROOT"/libvmx/src/*.h "$PFTC"/
+extract_rev_file "$TC_PREFIX_REV" "libvmx/src/vmxcodec.cpp"   "$PFTC/vmxcodec.cpp"   tc-prefix
+extract_rev_file "$TC_PREFIX_REV" "libvmx/src/thread_tasks.h" "$PFTC/thread_tasks.h" tc-prefix
+must_grep     "$PFTC/vmxcodec.cpp"   'instance->Tasks = CreateTasks(instance->Threads);' tc-prefix
+must_not_grep "$PFTC/vmxcodec.cpp"   'VMX_AvailableCpuCount'                            tc-prefix
+must_grep     "$PFTC/thread_tasks.h" 'vmx-thread-task-predicate-wait-p0-11'             tc-prefix
+compile_tc tc-prefix "$PFTC" && score_run_under tc-prefix fail tc-prefix taskset -c 0-3
+
+# TC1: the cap removed. On an unrestricted box this copy is indistinguishable from the fixed one —
+# which is why the control runs it under the 4-CPU mask, where the difference is 8 threads vs 4.
+TC1=$(fresh_copy_vmx mutant-no-thread-cap)
+if apply_mutant tc-mutant-no-thread-cap "$TC1/vmxcodec.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ("\t{\n"
+       "\t\tint runnable = VMX_AvailableCpuCount();\n"
+       "\t\tif (runnable < 1) runnable = 1;\n"
+       "\t\tif (instance->Threads > runnable) instance->Threads = runnable;\n"
+       "\t\tif (instance->Threads < 1) instance->Threads = 1;\n"
+       "\t}\n")
+assert s.count(old) == 1, "the worker-thread cap is not where this tree put it"
+open(p, "w").write(s.replace(old, "\t// MUTANT: the table's number is the number, as it used to be\n", 1))
+PY
+then compile_tc tc-mutant-no-thread-cap "$TC1" && \
+     score_run_under tc-mutant-no-thread-cap fail tc-mutant-no-thread-cap taskset -c 0-3
+fi
+
+# TC2: the sabotage the acceptance bar asks for — force an absurd worker count. It must still BUILD
+# (nothing here is a compile-time assertion) and it must be caught by the gate at full machine
+# width, with no taskset involved: 999 slice threads is > runnable on any box that can run the test.
+TC2=$(fresh_copy_vmx mutant-threads-999)
+if apply_mutant tc-mutant-threads-999 "$TC2/vmxcodec.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = ("\t{\n"
+       "\t\tint runnable = VMX_AvailableCpuCount();\n"
+       "\t\tif (runnable < 1) runnable = 1;\n"
+       "\t\tif (instance->Threads > runnable) instance->Threads = runnable;\n"
+       "\t\tif (instance->Threads < 1) instance->Threads = 1;\n"
+       "\t}\n")
+assert s.count(old) == 1, "the worker-thread cap is not where this tree put it"
+open(p, "w").write(s.replace(old, "\tinstance->Threads = 999;   // MUTANT: sabotage the cap\n", 1))
+PY
+then compile_tc tc-mutant-threads-999 "$TC2" && score_tc tc-mutant-threads-999 fail
+fi
+
+# ---------------------------------------------------------------------------
+# encode-pipeline (et-*): the ImageReader callback may not wait for the codec.
+#
+# THE FAILURE. OMTStreamingManager's onImageAvailable ran pack + encode + headers inline, and
+# ImageReader is created with maxImages=3 — the camera cannot recycle a buffer until the callback
+# returns, so the delivered frame rate IS 1/(the callback's cost), whatever the camera or the
+# declared rate asked for. Measured on one rig, both ways: the native x86_64 emulator build gates
+# green at 30.4/30.2 fps, the same build under arm64 translation delivers 11-13. Same camera, same
+# declaration; only the callback's cost moved. That is the "~14 fps delivered vs 30 declared"
+# report, and no scenario in this file could see it, because none of them ran a callback.
+#
+# WHAT CHANGED: the callback now vets the caller's plane claims and COPIES the plane bytes — the two
+# things that must happen before the Image is closed — into a depth-3 drop-oldest ring, and a
+# dedicated encoder thread runs packNv12 + omt_send (app/src/main/cpp/OMTBridge.cpp). qa/encode-pipeline
+# .cpp drives that REAL translation unit through qa/host-jni/jni.h with the codec replaced at LINK
+# time by qa/stub_vmx.cpp sleeping 70 ms per encode: the seam that makes "did the producer wait?" a
+# measurable question on a host with no camera and no phone. The #31 admission checks moved with the
+# read they guard — they belong to the copy now — and qa/jni-boundary.cpp still drives the same TU,
+# so jb-mutant-no-admission still dies under ASan rather than being retired by the refactor.
+#
+# The invariants the mutants below are each one line wide: the callback returns while an encode is
+# still running (E1); delivered frames are FIFO, byte-exact against the packer's own oracle, and
+# each in ITS OWN destination buffer (E2/E2b); the excess is evicted AND COUNTED, newest frame always
+# wins a slot (E3..E3d); teardown joins the encoder thread in bounded time and drains what it already
+# took (E4); a lie about a plane is refused before the copy reads it (E5); and the copy preserves the
+# address relationship planChroma() decides the chroma layout from (E6e) — the one refactor-shaped
+# defect in this change that would not have changed a single output byte.
+# ---------------------------------------------------------------------------
+
+# The pre-decoupling capture path, pinned to the immutable commit this branch sits on — NOT HEAD~1,
+# which changes meaning every time the branch grows a commit. OMTBridge.cpp AND omtnv12.h come from
+# that one rev: a .cpp pinned to yesterday compiled against the tree's header today is not a program
+# (see the header-mixing lesson in the aligned-stride and channel sections above).
+ET_PREFIX_REV=${ET_PREFIX_REV:-9c0820668b39353b999850b2884dca2d05083b40}
+
+# build_et <name> <expect pass|fail> <OMTBridge.cpp to compile> [extra flags]
+# The bridge is the production TU; the codec is the link-time stub, which is what lets the scenario
+# decide how long an encode takes. The real sender sits between them, so the frames under test
+# travel the whole path the phone uses: bridge -> packNv12 -> Sender::send -> encodeFrame -> seam.
+build_et() {
+  local name=$1 expect=$2 bridge=$3; shift 3
+  local extra="$*"
+  [ -f "$bridge" ] || harness_die "build_et $name: no such bridge source: $bridge"
+  rm -f "$SCRATCH/$name"
+  # shellcheck disable=SC2086
+  $CXX $FLAGS $extra $INC -I"$(dirname "$bridge")" -I"$ROOT/qa/host-jni" -I"$ROOT/app/src/main/cpp" \
+       "$ROOT/qa/encode-pipeline.cpp" "$bridge" \
+       "$ROOT/libomt/cpp/OMTChannel.cpp" "$ROOT/libomt/cpp/OMTAsyncPool.cpp" \
+       "$ROOT/libomt/cpp/OMTSender.cpp" "$ROOT/libomt/cpp/OMTDiscovery.cpp" \
+       "$ROOT/qa/stub_vmx.cpp" \
+       -o "$SCRATCH/$name" 2>"$SCRATCH/$name.build.log"
+  if [ $? -ne 0 ] || [ ! -x "$SCRATCH/$name" ]; then
+    echo "  $name: BUILD FAILED (refusing to score an absent run)"
+    sed 's/^/      /' "$SCRATCH/$name.build.log" | head -15
+    FAILED+=("$name(build-failed)"); rc=1; return
+  fi
+  score_run "$name" "$expect"
+}
+
+echo "== encode-pipeline: the ImageReader callback must not wait for the codec =="
+build_et et-fixed pass "$ROOT/app/src/main/cpp/OMTBridge.cpp"
+
+# THE ANTI-VACUITY CONTROL. Same scenario, same assertions, the OMTBridge.cpp and the omtnv12.h it
+# was written against — both from the SAME immutable rev, because a .cpp pinned to yesterday with
+# its header from today is not a program (the header-mixing lesson recorded above). It must be red,
+# and it must be red on the line that says the callback blocked in pack+encode+send.
+PF_ET="$SCRATCH/et-prefix-bridge"; rm -rf "$PF_ET"; mkdir -p "$PF_ET"
+extract_rev_file "$ET_PREFIX_REV" "app/src/main/cpp/OMTBridge.cpp" "$PF_ET/OMTBridge.cpp" et-prefix
+extract_rev_file "$ET_PREFIX_REV" "app/src/main/cpp/omtnv12.h"     "$PF_ET/omtnv12.h"     et-prefix
+must_grep     "$PF_ET/OMTBridge.cpp" 'return postFrame(env, dst, packed.stride' et-prefix
+must_grep     "$PF_ET/OMTBridge.cpp" 'admitSource(claims'                       et-prefix
+must_not_grep "$PF_ET/OMTBridge.cpp" 'nativeQueueFramePlanes'                   et-prefix
+must_not_grep "$PF_ET/OMTBridge.cpp" 'OMT_RING_DEPTH'                           et-prefix
+must_not_grep "$PF_ET/OMTBridge.cpp" 'g_ringDropped'                            et-prefix
+build_et et-prefix fail "$PF_ET/OMTBridge.cpp"
+
+# ET1: no eviction at all — the ring is full, so refuse the newest frame. The counts stop balancing
+# and the drop counter never moves: exactly the "a healthy stream that is simply idle" lie the
+# sender's own counters were written against, one level up.
+ET1=$(fresh_copy_jni mutant-et-no-eviction)
+mutate_jni "$ET1" OMTBridge.cpp \
+  '        if (g_ringOrderLen == 0) {
+            LOGE("Frame ring has no empty slot and nothing queued — refusing the frame");
+            return JNI_FALSE;
+        }
+        idx = (int)g_ringOrder[0];
+        evictedSeq = g_ring[idx].seq;
+        for (size_t i = 1; i < g_ringOrderLen; ++i) g_ringOrder[i - 1] = g_ringOrder[i];
+        --g_ringOrderLen;
+        evicted = true;' \
+  '        return JNI_FALSE;   // MUTANT: keep the queue as it is and refuse the new frame' \
+  "never evict the oldest frame"
+build_et et-mutant-no-eviction fail "$ET1/OMTBridge.cpp"
+
+# ET2: claim from the BACK of the queue. The newest frame jumps in front of the ones already
+# waiting, which is a reordering — the counts still balance, so only the per-frame payload oracle
+# sees it.
+ET2=$(fresh_copy_jni mutant-et-reorder)
+mutate_jni "$ET2" OMTBridge.cpp \
+  '                idx = (int)g_ringOrder[0];
+                for (size_t i = 1; i < g_ringOrderLen; ++i) g_ringOrder[i - 1] = g_ringOrder[i];
+                --g_ringOrderLen;
+                g_ringState[idx] = SlotBusy;' \
+  '                idx = (int)g_ringOrder[g_ringOrderLen - 1];   // MUTANT: LIFO — the newest frame goes first
+                --g_ringOrderLen;
+                g_ringState[idx] = SlotBusy;' \
+  "claim frames out of order"
+build_et et-mutant-reorder fail "$ET2/OMTBridge.cpp"
+
+# ET3: the eviction counted twice. A counter that lies is worse than no counter, because the UI and
+# this suite both read it as the difference between "the encoder is keeping up" and "it is not".
+ET3=$(fresh_copy_jni mutant-et-counter-double-count)
+mutate_jni "$ET3" OMTBridge.cpp \
+  '        const unsigned long long total = g_ringDropped.fetch_add(1) + 1;' \
+  '        const unsigned long long total = g_ringDropped.fetch_add(2) + 2;  // MUTANT: two per eviction' \
+  "double-count the drop-oldest counter"
+build_et et-mutant-counter-double-count fail "$ET3/OMTBridge.cpp"
+
+# ET4: the teardown deadlock, in the shape it would actually take — join the encoder thread while
+# holding the mutex the encoder needs to post. The scenario hangs inside nativeCleanup and the
+# harness scores the hang red, exactly as the #24 stop-deadlock gate does.
+ET4=$(fresh_copy_jni mutant-et-join-under-sender-lock)
+mutate_jni "$ET4" OMTBridge.cpp \
+  'void stopEncoderThread() {
+    std::thread victim;' \
+  'void stopEncoderThread() {
+    std::lock_guard<std::mutex> senderLock(g_senderMutex);   // MUTANT: the join is taken under the mutex the encoder needs to post
+    std::thread victim;' \
+  "join the encoder thread under g_senderMutex"
+build_et et-mutant-join-under-sender-lock fail "$ET4/OMTBridge.cpp"
+
+# ET5: one destination buffer for every frame — the shared frameBuffer the ring replaced. The bytes
+# still come out right (the encoder is single-threaded), which is precisely why the assertion is on
+# the DESTINATIONS being distinct and not only on the payloads being right.
+ET5=$(fresh_copy_jni mutant-et-shared-dst)
+mutate_jni "$ET5" OMTBridge.cpp \
+  '    resizeBytes(slot.packed, (size_t)need);
+    omtpack::Result packed{};
+    char why[256] = {};
+    if (!packCopy(slot.copy, slot.packed.data(), (int64_t)slot.packed.size(), packed,' \
+  '    static std::vector<uint8_t> sharedPacked;   // MUTANT: one frameBuffer reused across frames, as it was
+    resizeBytes(sharedPacked, (size_t)need);
+    omtpack::Result packed{};
+    char why[256] = {};
+    if (!packCopy(slot.copy, sharedPacked.data(), (int64_t)sharedPacked.size(), packed,' \
+  "pack every frame into one shared buffer"
+build_et et-mutant-shared-dst fail "$ET5/OMTBridge.cpp"
+
+# ET6: drop-NEWEST, the policy qa/slow-subscriber.cpp documents the channel queue replacing. Every
+# count still balances and the order is still FIFO; what changes is that the viewer keeps the OLDEST
+# frames. E3d is the assertion that exists for this mutant.
+ET6=$(fresh_copy_jni mutant-et-drop-newest)
+mutate_jni "$ET6" OMTBridge.cpp \
+  '        idx = (int)g_ringOrder[0];
+        evictedSeq = g_ring[idx].seq;
+        for (size_t i = 1; i < g_ringOrderLen; ++i) g_ringOrder[i - 1] = g_ringOrder[i];
+        --g_ringOrderLen;
+        evicted = true;' \
+  '        idx = (int)g_ringOrder[g_ringOrderLen - 1];   // MUTANT: drop-newest, the policy the channel queue replaced
+        evictedSeq = g_ring[idx].seq;
+        --g_ringOrderLen;
+        evicted = true;' \
+  "evict the newest frame instead of the oldest"
+build_et et-mutant-drop-newest fail "$ET6/OMTBridge.cpp"
+
+# ET7: the chroma pair copied into two separate allocations. planChroma() decides CB_CR from CR_CB
+# from "malformed" off the ADDRESSES of the two windows, so flattening them does not change a single
+# output byte — it deletes a refusal. E6e is that refusal, seen from the capture path.
+ET7=$(fresh_copy_jni mutant-et-chroma-offset)
+mutate_jni "$ET7" OMTBridge.cpp \
+  '    if (sharesBytes) {
+        const uintptr_t lo = std::min(ua, va);' \
+  '    if (false && sharesBytes) {   // MUTANT: every pair becomes two allocations, whatever the HAL reported
+        const uintptr_t lo = std::min(ua, va);' \
+  "copy the chroma pair apart and lose the address relationship"
+build_et et-mutant-chroma-offset fail "$ET7/OMTBridge.cpp"
+
+
 echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
   echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"

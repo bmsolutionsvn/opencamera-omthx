@@ -70,7 +70,6 @@ public class OMTStreamingManager {
     private HandlerThread backgroundThread;
     private Handler backgroundHandler;
 
-    private ByteBuffer frameBuffer;
     private boolean isAnnouncing = false; // mDNS is active, device is discoverable
     private boolean isStreaming = false; // Camera frames are being sent
 
@@ -223,7 +222,10 @@ public class OMTStreamingManager {
             imageReader = ImageReader.newInstance(
                     width, height,
                     ImageFormat.YUV_420_888,
-                    3 // Max images in the queue
+                    3 // Max images in the queue — and the reason the callback must be cheap: the
+                      // camera cannot recycle a buffer until onImageAvailable returns, so the cost
+                      // of that callback is the delivered frame rate. It queues into the bridge's
+                      // encoder ring (same depth, app/src/main/cpp/OMTBridge.cpp) and returns.
             );
             imageReader.setOnImageAvailableListener(imageListener, backgroundHandler);
 
@@ -376,10 +378,11 @@ public class OMTStreamingManager {
      *   the encoder reads 3110400 bytes, dataLength is 2592000
      *
      * 2592000 is 1080*1920 + 540*960: the chroma plane charged at its own half-width row while the
-     * encoder walks it at the luma stride. The planes are now handed to the native packer
-     * (app/src/main/cpp/omtnv12.h) as the Image described them; it reads each one with its OWN
-     * rowStride/pixelStride, interleaves Cb/Cr when the layout is planar, and reports the geometry
-     * it really wrote, so the length the sender is told and the bytes the encoder reads agree.
+     * encoder walks it at the luma stride. The planes are now handed to the native boundary as the
+     * Image described them; it reads each one with its OWN rowStride/pixelStride, interleaves Cb/Cr
+     * when the layout is planar, and reports the geometry it really wrote, so the length the sender
+     * is told and the bytes the encoder reads agree. That happens on the bridge's encoder thread —
+     * see OMTSender.queueFramePlanes, and the frame-ring comment in app/src/main/cpp/OMTBridge.cpp.
      */
     private void sendFrame(Image image) {
         if (omtSender == null || !isStreaming) {
@@ -414,13 +417,6 @@ public class OMTStreamingManager {
                     + ", packedSize=" + packedSize);
         }
 
-        // Allocate or resize the packed-NV12 buffer if needed. It is written and read natively by
-        // address (no Java put/flip), so its position and limit carry no meaning here.
-        if (frameBuffer == null || frameBuffer.capacity() < packedSize) {
-            frameBuffer = ByteBuffer.allocateDirect((int) packedSize);
-            Log.d(TAG, "Allocated frame buffer: " + packedSize + " bytes");
-        }
-
         ByteBuffer yBuffer = yPlane.getBuffer();
         yBuffer.rewind();
         ByteBuffer uBuffer = uPlane.getBuffer();
@@ -428,20 +424,29 @@ public class OMTStreamingManager {
         ByteBuffer vBuffer = vPlane.getBuffer();
         vBuffer.rewind();
 
-        boolean sent = omtSender.sendFramePlanes(
-                frameBuffer,
+        // The capture path queues; it does not encode. Everything this call used to do inline —
+        // packNv12, omt_send, Sender::send, the codec's Push/Join over its slice threads — now runs
+        // on the bridge's encoder thread, because this method is the ImageReader callback and that
+        // callback's cost IS the delivered frame rate (maxImages=3, so the camera waits on it).
+        // Measured on one rig: native x86_64 emulator build, 30.4/30.2 fps; the same build under
+        // arm64 translation, 11-13 fps. Same camera, same declared rate, different callback.
+        //
+        // There is deliberately no ByteBuffer allocated here any more: the native ring slot owns the
+        // packed destination, because one frameBuffer reused across frames would let frame N+1's pack
+        // overwrite bytes frame N is still handing to the socket.
+        boolean queued = omtSender.queueFramePlanes(
                 yBuffer, yBuffer.limit(), yRowStride, yPlane.getPixelStride(),
                 uBuffer, uBuffer.limit(), uPlane.getRowStride(), uPlane.getPixelStride(),
                 vBuffer, vBuffer.limit(), vPlane.getRowStride(), vPlane.getPixelStride(),
                 width, height);
 
-        if (!sent) {
+        if (!queued) {
             // The native side logs why; this is the tally that keeps a device-wide refusal from
             // looking like a healthy stream that is simply idle.
             sendFailureCount++;
             if (sendFailureCount <= 3 || (DEBUG_LOGS && sendFailureCount % 30 == 0)) {
-                Log.w(TAG, "sendFrame: frame " + sentFrameCount + " did not reach any receiver "
-                        + "(" + sendFailureCount + " refused/unsent so far)");
+                Log.w(TAG, "sendFrame: frame " + sentFrameCount + " was refused at the native boundary "
+                        + "(" + sendFailureCount + " refused so far)");
             }
         }
     }
@@ -477,6 +482,7 @@ public class OMTStreamingManager {
         backgroundHandler.post(new Runnable() {
             private int lastCount = -1;
             private int lastProfile = -1;
+            private long lastRingDrops = 0;
 
             @Override
             public void run() {
@@ -508,6 +514,16 @@ public class OMTStreamingManager {
                 // Check for frame drops (only while streaming)
                 if (isStreaming) {
                     long recentDrops = omtSender.getRecentDropsAndReset();
+                    // The encoder ring's own drops are a different stall from a network stall: the
+                    // camera produced the frame and the encode could not take it in time. Report both
+                    // — a delivered rate alone cannot tell them apart, and only one of them is Wi-Fi.
+                    long ringDrops = omtSender.getRingDrops();
+                    if (ringDrops > lastRingDrops) {
+                        Log.w(TAG, "Encoder ring dropped " + (ringDrops - lastRingDrops)
+                                + " frame(s) (total " + ringDrops + ") — the encode cannot keep up"
+                                + " with " + streamFps + " fps at " + streamWidth + "x" + streamHeight);
+                        lastRingDrops = ringDrops;
+                    }
                     if (recentDrops > 0) {
                         long totalDropped = omtSender.getFramesDropped();
                         long totalSent = omtSender.getFramesSent();
@@ -537,8 +553,9 @@ public class OMTStreamingManager {
             imageReader.close();
             imageReader = null;
         }
-        // Clear frame buffer
-        frameBuffer = null;
+        // The packed-frame buffers live in the native ring now, and the encoder thread that owns
+        // them is stopped and joined by OMTSender.cleanup() -> nativeCleanup, which drains what the
+        // camera already handed over before it lets the sender go away.
     }
 
     /**

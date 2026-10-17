@@ -28,6 +28,9 @@
 #include <chrono>
 #include <iostream>
 #include <fstream>
+#if defined(__linux__) || defined(__ANDROID__)
+#include <sched.h>   // sched_getaffinity / CPU_COUNT: how many CPUs this process may run on
+#endif
 
 #if defined(X64)
 #include "vmxcodec_x86.h"
@@ -214,6 +217,35 @@ static int VMX_CalculateBitrate(int targetMbps, bool min)
 	return (int)t;
 }
 
+/*
+ * How many CPUs can this process actually run on right now?
+ *
+ * std::thread::hardware_concurrency() is NOT that number. It answers "how many CPUs are online"
+ * (glibc/bionic: sysconf(_SC_NPROCESSORS_ONLN)), and on both a host and a phone that count includes
+ * cores this process will never be scheduled on:
+ *   - a cpuset-restricted or containerised process (taskset -c 0-3 still reports 32 here — measured,
+ *     see the qa/build-host.sh tc-* section);
+ *   - an Android app: the scheduler parks background work on the little cores and EAS can take big
+ *     cores offline, while the online count still lists all of them.
+ * The affinity mask is the number that describes what can run; hardware_concurrency() is the
+ * fallback for platforms with no affinity API (Windows, where the desktop vendored copy builds).
+ */
+static int VMX_AvailableCpuCount()
+{
+#if defined(__linux__) || defined(__ANDROID__)
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if (sched_getaffinity(0, sizeof(set), &set) == 0)
+	{
+		int n = CPU_COUNT(&set);
+		if (n >= 1)
+			return n;
+	}
+#endif
+	unsigned n = std::thread::hardware_concurrency();
+	return n > 0 ? (int)n : 1;   // 0 means "could not determine" — never fan out to zero tasks
+}
+
 VMX_API VMX_INSTANCE* VMX_Create(VMX_SIZE dimensions, VMX_PROFILE profile, VMX_COLORSPACE colorSpace)
 {
 	if (dimensions.width < VMX_MIN_WIDTH) return NULL;
@@ -304,6 +336,33 @@ VMX_API VMX_INSTANCE* VMX_Create(VMX_SIZE dimensions, VMX_PROFILE profile, VMX_C
 	}	
 
 	//instance->Threads = 1;
+
+	/* ---- cap the fan-out to the CPUs this process can actually run on ----------------------
+	 *
+	 * VMX_EncodePlanes (vmxcodec.cpp:~1700) pushes one slice range per thread and then Joins
+	 * ALL of them: the frame is not done until the slowest slice is done. instance->Threads is
+	 * picked from VMX_BITRATE_TABLE (2 at <=1440p, 4 at 2160p, 8 at 4320p) and then overridden to
+	 * 8/16 for 2160p/4320p whenever hardware_concurrency() says the box has 8/16 CPUs — a number
+	 * that counts every ONLINE cpu, not the ones this process may run on. Ask for 16 slice
+	 * threads on an 8-core big.LITTLE phone (or on a cpuset-restricted container) and every frame
+	 * pays two rounds of scheduling for the second eight, with Join holding the whole frame open
+	 * while the last slice waits for a little core that a foreground app is using.
+	 *
+	 * The cap changes only the task fan-out. SliceCount (vmxcodec.cpp:409) and the slice ranges
+	 * each task is handed stay exactly as the codec computed them, so the bitstream — and every
+	 * byte a receiver reads — is unchanged: qa/build-host.sh's tc-* section proves the same
+	 * input encodes to the same payload at 1, 4, 8 and 16 threads.
+	 *
+	 * Clamped to >= 1 because VMX_EncodePlanes divides by it (totalSlices / numThreads): a zero
+	 * here is a SIGFPE on the first frame, and hardware_concurrency() is allowed to return 0.
+	 */
+	{
+		int runnable = VMX_AvailableCpuCount();
+		if (runnable < 1) runnable = 1;
+		if (instance->Threads > runnable) instance->Threads = runnable;
+		if (instance->Threads < 1) instance->Threads = 1;
+	}
+
 	instance->Tasks = CreateTasks(instance->Threads);
 
 	//128bit SIMD
