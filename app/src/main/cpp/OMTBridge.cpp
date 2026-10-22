@@ -728,6 +728,80 @@ Java_net_sourceforge_opencamera_OMTSender_nativeQueueFramePlanes(
 }
 
 /**
+ * Send one already-encoded access unit (OMT HX) to every subscribed receiver.
+ *
+ * The phone's MediaCodec encoder fills a direct ByteBuffer; this hands libomt the same bytes under
+ * the codec tag the receiver switches on, with the geometry and rate of THIS frame (the globals are
+ * captured at announcement time and go stale if the resolution changes), and the timestamp in the
+ * OMT header's 100 ns ticks.
+ *
+ * Returns false for anything refused before the sender sees it: a buffer whose claimed range is not
+ * inside its capacity, an unknown tag, a zero frame-rate divisor, or the sender's own refusal.
+ * "Nobody is connected" is not a failure — omt_send() answers 1 there, exactly like the raw path.
+ */
+JNIEXPORT jboolean JNICALL
+Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+        JNIEnv* env, jobject /* this */,
+        jobject buffer, jint offset, jint length, jint codec,
+        jint width, jint height, jint frameRateN, jint frameRateD, jlong ptsNs) {
+
+    std::lock_guard<std::mutex> lock(g_senderMutex);
+
+    if (g_sender == nullptr) {
+        LOGE("Cannot send coded frame: sender not initialized");
+        return JNI_FALSE;
+    }
+    if (codec != OMTCodec_HEVC && codec != OMTCodec_H264) {
+        LOGE("Coded frame refused: codec tag 0x%08X is neither HEVC nor H264", (unsigned)codec);
+        return JNI_FALSE;
+    }
+    void* data = env->GetDirectBufferAddress(buffer);
+    if (data == nullptr) {
+        LOGE("Coded frame refused: not a direct buffer");
+        return JNI_FALSE;
+    }
+    const jlong capacity = env->GetDirectBufferCapacity(buffer);
+    if (offset < 0 || length <= 0 || capacity < 0 || (jlong)offset + (jlong)length > capacity) {
+        LOGE("Coded frame refused: offset %d + length %d is outside the buffer's capacity %lld",
+             (int)offset, (int)length, (long long)capacity);
+        return JNI_FALSE;
+    }
+    if (width <= 0 || height <= 0) {
+        LOGE("Coded frame refused: %dx%d is not a picture size", (int)width, (int)height);
+        return JNI_FALSE;
+    }
+    if (frameRateN <= 0 || frameRateD <= 0) {
+        LOGE("Coded frame refused: frame rate %d/%d has a non-positive side",
+             (int)frameRateN, (int)frameRateD);
+        return JNI_FALSE;
+    }
+
+    OMTMediaFrame frame{};
+    frame.Type = OMTFrameType_Video;
+    frame.Codec = (OMTCodec)codec;
+    frame.Width = width;
+    frame.Height = height;
+    frame.Stride = width;   // unused for a coded frame; kept consistent with the raw path
+    frame.FrameRateN = frameRateN;
+    frame.FrameRateD = frameRateD;
+    frame.AspectRatio = (float)width / (float)height;
+    frame.Flags = OMTVideoFlags_None;
+    // Same height rule as the NV12 path (OMTBridge.cpp): HD and above is BT.709.
+    frame.ColorSpace = (height >= 720) ? OMTColorSpace_BT709 : OMTColorSpace_BT601;
+    // The wire carries 100 ns ticks; MediaCodec reports nanoseconds.
+    frame.Timestamp = ptsNs / 100;
+    frame.Data = static_cast<uint8_t*>(data) + offset;
+    frame.DataLength = length;
+
+    const int sent = omt_send(g_sender, &frame);
+    if (sent <= 0) {
+        LOGE("Coded frame refused by the sender (see its log line above)");
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
+}
+
+/**
  * Frames the ring evicted to keep the callback non-blocking since the sender was created.
  *
  * This is the number that distinguishes "the camera is producing 30 fps and the encoder is keeping

@@ -135,6 +135,33 @@ public class OMTSender {
     }
 
     /**
+     * Send one already-encoded access unit (OMT HX), e.g. a buffer from {@code OMTHXEncoder}.
+     *
+     * The geometry and rate belong to this frame: the native globals are captured when the sender
+     * is announced, and a resolution change afterwards would otherwise advertise the old size over
+     * the new picture (which OMT-HX receivers treat as a decode error).
+     *
+     * @param buffer     direct ByteBuffer holding the Annex-B access unit
+     * @param offset     first byte of the access unit within {@code buffer}
+     * @param length     access-unit length in bytes
+     * @param codec      {@link #CODEC_HEVC} or {@link #CODEC_H264}
+     * @param ptsNs      presentation time in nanoseconds (the wire carries 100 ns ticks)
+     * @return true when the sender accepted it; "nobody connected" still counts as accepted
+     */
+    public boolean sendCoded(ByteBuffer buffer, int offset, int length, int codec,
+                             int width, int height, int frameRateN, int frameRateD, long ptsNs) {
+        if (!isInitialized) {
+            Log.e(TAG, "Cannot send coded frame: OMTSender not initialized");
+            return false;
+        }
+        if (buffer == null || !buffer.isDirect()) {
+            Log.e(TAG, "Coded frame buffer must be a direct ByteBuffer");
+            return false;
+        }
+        return nativeSendCoded(buffer, offset, length, codec, width, height, frameRateN, frameRateD, ptsNs);
+    }
+
+    /**
      * Bytes of NV12 a destination buffer must hold for a frame whose luma rowStride is
      * {@code yRowStride}. Same arithmetic as {@code omtpack::nv12Size} in
      * app/src/main/cpp/omtnv12.h — the packer declares the stride, the caller allocates for it.
@@ -412,6 +439,14 @@ public class OMTSender {
     private native boolean nativeInit(String name, int width, int height, int frameRateN, int frameRateD, int quality);
 
     private native boolean nativeSendFrame(ByteBuffer buffer, int width, int height, int yStride, int uvStride);
+
+    /** The OMT FourCCs an HX access unit can carry (same numbers as libomt.h OMTCodec_HEVC/H264). */
+    public static final int CODEC_HEVC = 0x43564548;
+    public static final int CODEC_H264 = 0x34363248;
+
+    private native boolean nativeSendCoded(ByteBuffer buffer, int offset, int length, int codec,
+                                           int width, int height, int frameRateN, int frameRateD,
+                                           long ptsNs);
 
     private native boolean nativeSendFramePlanes(ByteBuffer dst,
                                                  ByteBuffer y, int ySize, int yRowStride, int yPixelStride,

@@ -983,6 +983,16 @@ mutate_jni "$JB3" omtnv12.h \
   "stop refusing negative lengths by name"
 build_jni jb-mutant-no-negative fail "$JB3/OMTBridge.cpp"
 
+# JB4: the nanosecond-to-tick conversion dropped. The wire field is 100 ns ticks; handing it
+# microseconds makes every frame look 10x too close, which changes the pacing a receiver derives and
+# silences its gap detection. C1i is the only assertion that can see it.
+JB4=$(fresh_copy_jni mutant-jni-pts-units)
+mutate_jni "$JB4" OMTBridge.cpp \
+  '    frame.Timestamp = ptsNs / 100;' \
+  '    frame.Timestamp = ptsNs;  // MUTANT: microseconds on a 100 ns wire field' \
+  "drop the tick conversion on the coded path"
+build_jni jb-mutant-pts-units fail "$JB4/OMTBridge.cpp"
+
 # Channel scenarios, with the HEADERS taken from the same copy as the sources. build_and_run resolves
 # includes against the tree, which is fine while a mutant changes only .cpp; here the pre-fix copy
 # changes Channel's member layout (sendSocketMutex_ is a member), and a test built against the tree's
