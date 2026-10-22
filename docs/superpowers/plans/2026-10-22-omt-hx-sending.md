@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- compileSdk 36, minSdk 21, targetSdk 36, `ndkVersion "27.0.12077973"`, CMake 3.22.1, ABIs `arm64-v8a` + `x86_64`.
+- compileSdk 36, minSdk 21, targetSdk 36, `ndkVersion "27.3.13750724"` (r27d; upstream pins 27.0.12077973), CMake 3.22.1, ABIs `arm64-v8a` + `x86_64`.
 - Codec tags on the wire: `'HEVC'` = `0x43564548`, `'H264'` = `0x34363248`, `'VMX1'` = `0x31584D56`.
 - Wire timestamps are **100 ns ticks**; the JVM passes nanoseconds and the JNI divides by 100.
 - Coded payloads are one Annex-B access unit per OMT video frame, 8-bit 4:2:0, no alpha, no interlace.

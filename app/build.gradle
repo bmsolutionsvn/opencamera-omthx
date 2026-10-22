@@ -82,7 +82,7 @@ android {
         }
     }
     
-    ndkVersion = "27.0.12077973"
+    ndkVersion = "27.3.13750724"   // r27d; same r27 generation as the previous 27.0 pin
     //useLibrary 'android.test.mock'
 }
 
