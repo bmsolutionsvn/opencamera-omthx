@@ -26,8 +26,10 @@ Settings → Video settings → OMT Network Streaming → **Streaming Mode**:
 
 HX notes:
 
-- Geometry follows the current video profile and is clamped to what the encoder really supports
-  (up to 4K120 where the device allows it); the status line shows the geometry actually in use.
+- Geometry follows the current video profile and is clamped to what the encoder really supports;
+  the status line shows the geometry actually in use. High-speed (120/240 fps) video profiles are
+  not supported in HX mode — the camera does not offer the OMT surface in a high-speed session, so
+  the app says so instead of streaming nothing.
 - H.265 is used when the device has an HEVC encoder, otherwise it falls back to H.264.
 - Quality selects the bitrate: roughly 0.06/0.10/0.15 bits per pixel per frame for Low/Medium/High.
 - A Full-only receiver shows no picture in HX mode. That is expected — the mode is explicit.

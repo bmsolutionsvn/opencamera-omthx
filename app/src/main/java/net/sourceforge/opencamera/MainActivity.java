@@ -167,6 +167,7 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
 
     // OMT Network Streaming
     private OMTStreamingManager omtStreamingManager; // may be null - created when enabled in settings
+    private boolean omtStopPending; // a stop is waiting for the camera to release the OMT surface
 
     // private boolean ui_placement_right = true;
 
@@ -2321,6 +2322,15 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         if (MyDebug.LOG)
             Log.d(TAG, "clickedOmtStreaming");
 
+        // Between "stop" and the camera's close callback the surface is still owned by the session.
+        // A tap in that window must not restart (or re-stop) against a surface that is about to be
+        // released - that is the abandoned-BufferQueue death the ordering exists to prevent.
+        if (omtStopPending) {
+            if (MyDebug.LOG)
+                Log.d(TAG, "OMT stop is still waiting for the camera to close - ignoring tap");
+            return;
+        }
+
         if (omtStreamingManager != null && omtStreamingManager.isStreaming()) {
             // Stop streaming
             stopOmtStreaming();
@@ -2513,6 +2523,16 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         // device really supports (up to 4K120). Full mode keeps the profile untouched.
         String hxMime = null;
         if ("hx".equals(omtMode)) {
+            // CameraController2 leaves the OMT surface out of every high-speed capture session
+            // (`want_video_high_speed`), so an HX request at 120/240 fps would start "successfully"
+            // and then produce nothing at all. Say so instead of showing a red button over a black
+            // receiver.
+            if (preview.isVideoHighSpeed()) {
+                preview.showToast(null,
+                        "OMT HX cannot use a high-speed video profile - choose 60 fps or lower in Video settings",
+                        true);
+                return;
+            }
             hxMime = pickOmtHxMime("hevc".equals(omtHxCodec));
             if (hxMime == null) {
                 preview.showToast(null, "This device has no hardware H.265 or H.264 encoder", true);
@@ -2637,8 +2657,13 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         if (omtStreamingManager != null) {
             // The encoder surface (HX) must be released only after Camera2 has closed its session,
             // so stopStreaming runs from the detach callback rather than immediately after the call:
-            // a MediaCodec surface released while still targeted kills the process.
-            preview.setOmtStreamingSurface(null, omtStreamingManager::stopStreaming);
+            // a MediaCodec surface released while still targeted kills the process. The flag keeps a
+            // second tap from starting or stopping against that in-between state.
+            omtStopPending = true;
+            preview.setOmtStreamingSurface(null, () -> {
+                omtStreamingManager.stopStreaming();
+                omtStopPending = false;
+            });
             // Don't set to null - keep announcement active
         }
         updateOmtStreamingUI(false);

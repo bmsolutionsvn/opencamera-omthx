@@ -101,6 +101,16 @@ public class OMTHXEncoder {
      * has already let go of the surface (the caller sequences that: see Preview's CloseCameraCallback).
      */
     public void stop() {
+        stop(true);
+    }
+
+    /**
+     * @param releaseSurface false when the caller cannot prove the camera has detached (the activity
+     *                       is being destroyed while Camera2 closes asynchronously). The Surface is
+     *                       then left for the process teardown instead of being closed under a live
+     *                       capture session, which is a process death, not a leak.
+     */
+    public void stop(boolean releaseSurface) {
         running = false;
         if (thread != null) {
             try {
@@ -124,7 +134,9 @@ public class OMTHXEncoder {
         } catch (Exception e) {
             Log.w(TAG, "codec.release failed", e);
         }
-        surface.release();
+        if (releaseSurface) {
+            surface.release();
+        }
     }
 
     private void drainLoop() {
@@ -139,9 +151,12 @@ public class OMTHXEncoder {
                 }
                 return;
             }
+            if (index == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                readCsd(codec.getOutputFormat());
+                continue;
+            }
             if (index < 0) {
-                // INFO_TRY_AGAIN_LATER / INFO_OUTPUT_FORMAT_CHANGED: the parameter sets arrive with
-                // the keyframes (or as a codec-config buffer below), so there is nothing to publish.
+                // INFO_TRY_AGAIN_LATER: nothing encoded yet.
                 continue;
             }
             try {
@@ -165,6 +180,37 @@ public class OMTHXEncoder {
                 return;
             }
         }
+    }
+
+    /**
+     * Parameter sets published in the output format - the documented place, and the only one some
+     * encoders use. KEY_PREPEND_HEADER_TO_SYNC_FRAMES is optional and API 29+, so a receiver that
+     * joins mid-stream depends on these bytes reaching the stream some other way.
+     */
+    private void readCsd(MediaFormat format) {
+        byte[] out = concat(format.getByteBuffer("csd-0"), format.getByteBuffer("csd-1"));
+        if (out.length > 0) {
+            csd = out;
+        }
+    }
+
+    private static byte[] concat(ByteBuffer first, ByteBuffer second) {
+        final int firstLength = first == null ? 0 : first.remaining();
+        final int secondLength = second == null ? 0 : second.remaining();
+        byte[] out = new byte[firstLength + secondLength];
+        int at = 0;
+        if (first != null) {
+            ByteBuffer copy = first.duplicate();
+            copy.position(first.position());
+            copy.get(out, at, firstLength);
+            at += firstLength;
+        }
+        if (second != null) {
+            ByteBuffer copy = second.duplicate();
+            copy.position(second.position());
+            copy.get(out, at, secondLength);
+        }
+        return out;
     }
 
     private void emit(ByteBuffer buffer, MediaCodec.BufferInfo info) {

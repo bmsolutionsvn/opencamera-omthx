@@ -331,7 +331,9 @@ public class OMTStreamingManager {
         isStreaming = false;
         isAnnouncing = false;
         unregisterService();
-        cleanup();
+        // The activity is going away while Preview.onPause/onDestroy closes the camera
+        // asynchronously: do NOT close the encoder surface from here.
+        cleanup(false);
 
         if (callback != null) {
             callback.onStreamingStopped();
@@ -678,6 +680,10 @@ public class OMTStreamingManager {
      * Cleanup streaming only (ImageReader), keep OMT sender and mDNS active.
      */
     private void cleanupStreaming() {
+        cleanupStreaming(true);
+    }
+
+    private void cleanupStreaming(boolean releaseEncoderSurface) {
         // Release ImageReader only.
         //
         // THE FAILURE THIS PREVENTS. The reader used to be closed right here, on the main thread,
@@ -710,7 +716,7 @@ public class OMTStreamingManager {
             // The camera has already detached from this surface (Preview runs stopStreaming from its
             // CloseCameraCallback.onClosed), so releasing the codec here cannot pull the surface out
             // from under a live capture session. This joins the drain thread.
-            encoder.stop();
+            encoder.stop(releaseEncoderSurface);
         }
 
         final ImageReader reader = imageReader;
@@ -792,7 +798,16 @@ public class OMTStreamingManager {
      * Full cleanup - both streaming and announcement.
      */
     private void cleanup() {
-        cleanupStreaming();
+        cleanup(true);
+    }
+
+    /**
+     * @param releaseEncoderSurface false when the camera may still be closing (activity destroy:
+     *        the close is asynchronous, so closing the MediaCodec surface here would pull it out
+     *        from under a live session). The surface then goes with the process.
+     */
+    private void cleanup(boolean releaseEncoderSurface) {
+        cleanupStreaming(releaseEncoderSurface);
         cleanupAnnouncement();
     }
 

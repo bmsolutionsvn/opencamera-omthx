@@ -14,6 +14,10 @@ OMT code.
   next 1 s IDR rather than an on-demand keyframe. On a flaky link, lower the
   frame rate or use Full mode if that recovery window is too long.
 - **No preview/multiview stream.** A receiver asking for one gets program only.
+- **No high-speed video profiles.** `CameraController2` leaves the OMT surface out of any
+  high-speed capture session, so HX refuses to start (with a toast) when the current video profile
+  is 120/240 fps. Pick 60 fps or lower. The clamp to "up to 4K120" therefore means up to 4K at the
+  highest rate the device offers in a *normal* session.
 - **No live re-clamp.** Encoder capabilities can shrink under thermal load; the
   stream keeps the geometry chosen at start. Restart streaming if the device
   throttles.
