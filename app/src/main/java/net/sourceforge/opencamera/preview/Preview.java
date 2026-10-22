@@ -2235,10 +2235,30 @@ public class Preview implements SurfaceHolder.Callback, TextureView.SurfaceTextu
     }
 
     public void setOmtStreamingSurface(android.view.Surface surface) {
+        setOmtStreamingSurface(surface, null);
+    }
+
+    /**
+     * Sets the OMT streaming surface, and runs {@code afterDetach} once the camera has let go of it.
+     *
+     * A MediaCodec input surface (OMT HX) must not be released while Camera2 still targets it - that
+     * is the abandoned-BufferQueue process death this class already documents for the ImageReader.
+     * closeCamera()'s onClosed() runs after the device is closed and before the next open, which is
+     * exactly the window in which the owner may stop its encoder.
+     */
+    public void setOmtStreamingSurface(android.view.Surface surface, Runnable afterDetach) {
         if (MyDebug.LOG)
-            Log.d(TAG, "setOmtStreamingSurface: " + surface);
+            Log.d(TAG, "setOmtStreamingSurface: " + surface + " afterDetach=" + (afterDetach != null));
         this.omt_streaming_surface = surface;
-        reopenCamera();
+        closeCamera(true, new CloseCameraCallback() {
+            @Override
+            public void onClosed() {
+                if (afterDetach != null) {
+                    afterDetach.run();
+                }
+                openCamera();
+            }
+        });
     }
 
     /**
