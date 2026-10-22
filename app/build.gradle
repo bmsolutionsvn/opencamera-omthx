@@ -57,12 +57,11 @@ android {
             // choice of default file changes nothing about the APK produced today — it only sets
             // the floor for whoever turns minification on next.
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.txt'
-            // Only bind the release signing config when a keystore is actually configured. Without
-            // this guard, assembleRelease fails in validateSigningRelease on any checkout that has
-            // no local.properties (CI, a fresh clone) instead of producing an unsigned APK.
-            if (keystoreProperties['RELEASE_STORE_FILE']) {
-                signingConfig = signingConfigs.release
-            }
+            // No keystore in local.properties (CI, a fresh clone) → sign with the debug key. An
+            // unsigned APK is refused by Android ("package appears to be invalid"), so it is never
+            // a useful output. A debug-signed release installs fine but cannot go to Play or
+            // upgrade over a build signed with the real release key.
+            signingConfig = keystoreProperties['RELEASE_STORE_FILE'] ? signingConfigs.release : signingConfigs.debug
         }
     }
 
