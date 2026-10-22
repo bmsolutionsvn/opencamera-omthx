@@ -120,6 +120,11 @@ public class PreferenceSubVideo extends PreferenceSubScreen {
             // (PreferenceGroup)this.findPreference("preference_screen_video_settings");
             PreferenceGroup pg = (PreferenceGroup) this.findPreference("preferences_root");
             pg.removePreference(pref);
+            // no device frame rates means the OMT shortcut has nothing to offer either
+            Preference omtFpsPref = findPreference("preference_omt_stream_fps");
+            if (omtFpsPref != null) {
+                pg.removePreference(omtFpsPref);
+            }
         }
 
         if (video_fps != null) {
@@ -149,6 +154,38 @@ public class PreferenceSubVideo extends PreferenceSubScreen {
             lp.setValue(fps_value);
             // now set the key, so we save for the correct cameraId
             lp.setKey(fps_preference_key);
+
+            // OMT: the same camera setting, offered next to the streaming controls so it can be
+            // changed without hunting through Video settings. High-speed rates are left out: HX
+            // cannot use them (CameraController2 does not offer the OMT surface to a high-speed
+            // session), so listing one here would be a choice that fails on the next stream.
+            final ListPreference omtFps = (ListPreference) findPreference("preference_omt_stream_fps");
+            if (omtFps != null) {
+                java.util.ArrayList<CharSequence> omtEntries = new java.util.ArrayList<>();
+                java.util.ArrayList<CharSequence> omtValues = new java.util.ArrayList<>();
+                omtEntries.add(entries[0]);
+                omtValues.add(values[0]);
+                for (int k = 0; k < video_fps.length; k++) {
+                    if (video_fps_high_speed != null && video_fps_high_speed[k]) {
+                        continue;
+                    }
+                    omtEntries.add(String.valueOf(video_fps[k]));
+                    omtValues.add(String.valueOf(video_fps[k]));
+                }
+                omtFps.setEntries(omtEntries.toArray(new CharSequence[0]));
+                omtFps.setEntryValues(omtValues.toArray(new CharSequence[0]));
+                omtFps.setValue(fps_value);
+                omtFps.setOnPreferenceChangeListener(new Preference.OnPreferenceChangeListener() {
+                    @Override
+                    public boolean onPreferenceChange(Preference preference, Object newValue) {
+                        // The camera must really run at the chosen rate for the stream to carry it,
+                        // so this writes the same preference the video profile is built from; the
+                        // ordinary settings path reopens the camera on the way back.
+                        sharedPreferences.edit().putString(fps_preference_key, newValue.toString()).apply();
+                        return true;
+                    }
+                });
+            }
         }
 
         if (!supports_tonemap_curve && (camera_open

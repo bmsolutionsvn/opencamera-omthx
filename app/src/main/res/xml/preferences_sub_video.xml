@@ -200,6 +200,13 @@
             />
 
         <ListPreference
+            android:key="preference_omt_stream_fps"
+            android:title="Stream Frame Rate"
+            android:summary="Camera frame rate used by the stream (same setting as Video settings)"
+            android:dependency="preference_omt_streaming_enabled"
+            />
+
+        <ListPreference
             android:key="preference_omt_streaming_quality"
             android:title="Streaming Quality"
             android:summary="Low recommended for WiFi stability"
