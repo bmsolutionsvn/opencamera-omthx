@@ -57,7 +57,12 @@ android {
             // choice of default file changes nothing about the APK produced today — it only sets
             // the floor for whoever turns minification on next.
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.txt'
-            signingConfig = signingConfigs.release
+            // Only bind the release signing config when a keystore is actually configured. Without
+            // this guard, assembleRelease fails in validateSigningRelease on any checkout that has
+            // no local.properties (CI, a fresh clone) instead of producing an unsigned APK.
+            if (keystoreProperties['RELEASE_STORE_FILE']) {
+                signingConfig = signingConfigs.release
+            }
         }
     }
 
@@ -133,7 +138,7 @@ java {
 //     assemble, exactly as before.
 // The task refuses to guess when the directory holds more than one candidate APK rather than
 // picking one — a wrong-name leftover must not be able to be published as the real build.
-def omtApkNameFor = { buildType -> buildType == "release" ? "OpenCameraOMT.apk" : "OpenCameraOMT-${buildType}.apk" }
+def omtApkNameFor = { buildType -> buildType == "release" ? "BreadOMTCamera.apk" : "BreadOMTCamera-${buildType}.apk" }
 androidComponents {
     onVariants(selector().all()) { variant ->
         def variantName = variant.name
