@@ -806,6 +806,11 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         this.getOnBackPressedDispatcher().addCallback(this, pausePreviewOnBackPressedCallback);
         screenLockOnBackPressedCallback = new ScreenLockOnBackPressedCallback(false);
         this.getOnBackPressedDispatcher().addCallback(this, screenLockOnBackPressedCallback);
+        // The settings screens are fragments on the framework FragmentManager (getFragmentManager()), which the
+        // AndroidX back dispatcher used by this AppCompatActivity does not pop on its own. Without this callback,
+        // Back in settings finished the activity instead of leaving the screen: see settingsClosing().
+        settingsOnBackPressedCallback = new SettingsOnBackPressedCallback(settingsIsOpen());
+        this.getOnBackPressedDispatcher().addCallback(this, settingsOnBackPressedCallback);
 
         // create notification channel - only needed on Android 8+
         // update: notifications now removed due to needing permissions on Android 13+
@@ -3752,6 +3757,9 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         this.enablePopupOnBackPressedCallback(false);
         this.enablePausePreviewOnBackPressedCallback(false);
         this.enableScreenLockOnBackPressedCallback(false);
+        if (settingsOnBackPressedCallback != null) {
+            settingsOnBackPressedCallback.setEnabled(true);
+        }
 
         Bundle bundle = new Bundle();
         bundle.putBoolean("edge_to_edge_mode", edge_to_edge_mode);
@@ -4425,6 +4433,9 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
     void settingsClosing() {
         if (MyDebug.LOG)
             Log.d(TAG, "close settings");
+        if (settingsOnBackPressedCallback != null) {
+            settingsOnBackPressedCallback.setEnabled(false);
+        }
         setWindowFlagsForCamera();
         showPreview(true);
 
@@ -4570,6 +4581,32 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             Log.d(TAG, "enableScreenLockOnBackPressedCallback: " + enabled);
         if (screenLockOnBackPressedCallback != null) {
             screenLockOnBackPressedCallback.setEnabled(enabled);
+        }
+    }
+
+    private SettingsOnBackPressedCallback settingsOnBackPressedCallback;
+
+    /**
+     * Back inside the settings screens: up one level from a sub-screen, and out of settings from the
+     * root. The settings fragments live on the framework FragmentManager, which the AndroidX back
+     * dispatcher this activity uses does not pop by itself - so this pops it explicitly, and calls
+     * settingsClosing() to restore the camera and window flags when the root screen goes away.
+     */
+    private class SettingsOnBackPressedCallback extends OnBackPressedCallback {
+        public SettingsOnBackPressedCallback(boolean enabled) {
+            super(enabled);
+        }
+
+        @Override
+        public void handleOnBackPressed() {
+            if (MyDebug.LOG)
+                Log.d(TAG, "SettingsOnBackPressedCallback.handleOnBackPressed");
+            // The root settings fragment is also on the back stack, so >1 means a sub-screen is open.
+            final boolean subScreen = getFragmentManager().getBackStackEntryCount() > 1;
+            getFragmentManager().popBackStackImmediate();
+            if (!subScreen) {
+                settingsClosing();
+            }
         }
     }
 
