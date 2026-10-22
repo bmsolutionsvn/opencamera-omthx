@@ -339,6 +339,31 @@ public class PreferenceSubVideo extends PreferenceSubScreen {
                 }
             });
         }
+
+        // The HX codec only means anything in HX mode. ListPreference has no android:dependency
+        // (that needs a two-state preference), so the enabled state is set here.
+        final ListPreference modePref = (ListPreference) findPreference(PreferenceKeys.OmtStreamingModeKey);
+        final ListPreference codecPref = (ListPreference) findPreference(PreferenceKeys.OmtHxCodecKey);
+        if (modePref != null && codecPref != null) {
+            updateOmtCodecState(codecPref, modePref.getValue());
+            modePref.setOnPreferenceChangeListener(new Preference.OnPreferenceChangeListener() {
+                @Override
+                public boolean onPreferenceChange(Preference preference, Object newValue) {
+                    updateOmtCodecState(codecPref, newValue.toString());
+                    return true;
+                }
+            });
+        }
+    }
+
+    private void updateOmtCodecState(ListPreference codecPref, String mode) {
+        boolean hx = "hx".equals(mode);
+        codecPref.setEnabled(hx);
+        if (!hx) {
+            codecPref.setSummary("OMT HX only");
+        } else if (codecPref.getEntry() != null) {
+            codecPref.setSummary(codecPref.getEntry().toString());
+        }
     }
 
     private void updateOmtQualitySummary(ListPreference qualityPref) {

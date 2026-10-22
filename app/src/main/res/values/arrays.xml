@@ -1057,4 +1057,24 @@
         <item>50</item>
         <item>100</item>
     </string-array>
+
+    <!-- OMT Streaming Mode: Full = VMX (existing), HX = HEVC/H.264 access units -->
+    <string-array name="preference_omt_mode_entries">
+        <item>Full (VMX)</item>
+        <item>OMT HX (H.264/H.265)</item>
+    </string-array>
+    <string-array name="preference_omt_mode_values">
+        <item>full</item>
+        <item>hx</item>
+    </string-array>
+
+    <!-- OMT HX codec -->
+    <string-array name="preference_omt_hx_codec_entries">
+        <item>H.265 (HEVC)</item>
+        <item>H.264</item>
+    </string-array>
+    <string-array name="preference_omt_hx_codec_values">
+        <item>hevc</item>
+        <item>h264</item>
+    </string-array>
 </resources>
