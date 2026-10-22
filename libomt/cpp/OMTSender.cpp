@@ -5,6 +5,8 @@
 
 #include "OMTSender.h"
 #include "OMTProtocol.h"
+// The public C enum (OMTCodec_HEVC/H264): the tags below are pinned against it at compile time.
+#include "libomt.h"
 #include "../../libvmx/src/vmxcodec.h"
 // VMX_MIN/MAX_WIDTH/HEIGHT: the codec's own dimension limits. validateFrame() quotes them rather
 // than repeating the numbers, so the sender's gate and VMX_Create() cannot drift apart.
@@ -56,8 +58,13 @@ inline const char* codecName(int codec) {
     if (codec == Codec::UYVY) return "UYVY";
     if (codec == Codec::YUY2) return "YUY2";
     if (codec == Codec::NV12) return "NV12";
+    if (codec == Codec::HEVC) return "HEVC";
+    if (codec == Codec::H264) return "H264";
     return "unknown";
 }
+
+// Is this frame already encoded (OMT-HX), rather than a raw picture the sender must encode?
+inline bool isCodedCodec(int codec) { return codec == Codec::HEVC || codec == Codec::H264; }
 } // namespace
 
 Sender::Sender(const SenderConfig& config) : config_(config) {
@@ -515,7 +522,7 @@ bool Sender::interlacedHeightSupported(int height) {
 // directly with a contradictory pair instead of hoping the live path produces one.
 bool Sender::buildVideoHeaders(const MediaFrame& frame, const EncoderIdentity& encoder,
                               int encodedLen, FrameHeader& outHeader, VideoExtHeader& outExt,
-                              std::string& why) {
+                              std::string& why, int codec) {
     auto reject = [&why](const std::string& reason) {
         why = "wire declaration refused: " + reason;
         return false;
@@ -550,7 +557,7 @@ bool Sender::buildVideoHeaders(const MediaFrame& frame, const EncoderIdentity& e
     header.dataLength = VideoExtHeader::SIZE + encodedLen;
 
     VideoExtHeader ext{};
-    ext.codec = Codec::VMX1;
+    ext.codec = codec;
     ext.width = encoder.width;              // from the encoder, not from the frame
     ext.height = encoder.height;
     ext.frameRateN = frame.frameRateN;
@@ -570,6 +577,11 @@ bool Sender::buildVideoHeaders(const MediaFrame& frame, const EncoderIdentity& e
 static_assert(omt::ColorSpace::Undefined == 0 && omt::ColorSpace::BT601 == 601 &&
               omt::ColorSpace::BT709 == 709,
               "VideoExtHeader::colorSpace must use the OMT/VMX numbering (0/601/709)");
+
+// The Hx tags travel to OMT-HX's receivers (and to libomtnet), which switch on these numbers to
+// decide whether a payload is a VMX picture or an access unit to hand to a decoder.
+static_assert(omt::Codec::HEVC == OMTCodec_HEVC && omt::Codec::H264 == OMTCodec_H264,
+              "Hx codec tags must match the public C enum in libomt.h");
 
 // P0 #9 / P0 #16, ported from the desktop vendored sender and adapted to this tree. The
 // colour-space clause uses THIS project's names (ColorSpace::Undefined, not desktop's Unknown)
@@ -594,6 +606,11 @@ static_assert(omt::ColorSpace::Undefined == 0 && omt::ColorSpace::BT601 == 601 &
 // and no counter anywhere. The codec-specific `need` below is what catches it, computed with the
 // stride the encoder will actually use — not the one it was told the buffer has.
 bool Sender::validateFrame(const MediaFrame& frame, std::string& why) {
+    // An already-encoded frame (OMT-HX) is a different animal: no stride to walk, no VMX limits, and
+    // no encoder behind it. It still owes the wire a truthful declaration, so it gets its own gate -
+    // reached through here, so both entry points enforce exactly one of the two.
+    if (isCodedCodec(frame.codec)) return validateCodedFrame(frame, why);
+
     auto reject = [&why](const std::string& reason) {
         why = "frame rejected: " + reason;
         return false;
@@ -744,6 +761,54 @@ bool Sender::validateFrame(const MediaFrame& frame, std::string& why) {
     return true;
 }
 
+// The coded (OMT-HX) gate. Same contract as validateFrame(): refuse BEFORE the no-clients shortcut,
+// counted and named, so a frame that would have gone on air broken is refused on the bench. What
+// differs is what can be checked: an access unit has no stride and no VMX size limits, but the
+// header it will be published under must still describe it truthfully.
+bool Sender::validateCodedFrame(const MediaFrame& frame, std::string& why) {
+    auto reject = [&why](const std::string& reason) {
+        why = reason;
+        return false;
+    };
+    if (frame.data == nullptr)
+        return reject("coded frame with a null data pointer");
+    if (frame.width <= 0 || frame.height <= 0)
+        return reject("coded frame with no size (" + std::to_string(frame.width) + "x" +
+                      std::to_string(frame.height) + ")");
+    if ((frame.width & 1) != 0)
+        return reject("coded frame with odd width " + std::to_string(frame.width) +
+                      " (an H.264/HEVC 4:2:0 picture cannot have one)");
+    if (frame.dataLength <= 0)
+        return reject("coded frame with no payload (dataLength " + std::to_string(frame.dataLength) + ")");
+    // frameRateD is the divisor a receiver divides the timeline by; 0 or negative is not a rate.
+    if (frame.frameRateN <= 0 || frame.frameRateD <= 0)
+        return reject("coded frame advertised at " + std::to_string(frame.frameRateN) + "/" +
+                      std::to_string(frame.frameRateD) +
+                      " (frameRateN/frameRateD is a ratio; neither side may be non-positive)");
+    const float aspect = frame.aspectRatio;
+    if (!(aspect > 0.0f) || !std::isfinite(aspect))
+        return reject("coded frame's aspect ratio " + std::to_string(aspect) +
+                      " is not a positive finite number (a receiver divides by it)");
+    const bool known_colour_space = frame.colorSpace == ColorSpace::Undefined ||
+                                    frame.colorSpace == ColorSpace::BT601 ||
+                                    frame.colorSpace == ColorSpace::BT709;
+    if (!known_colour_space)
+        return reject("coded frame's colour space " + std::to_string(frame.colorSpace) +
+                      " is not one of the wire values 0/601/709");
+    const int knownFlags = VideoFlags::Interlaced | VideoFlags::Alpha | VideoFlags::PreMultiplied |
+                           VideoFlags::Preview | VideoFlags::HighBitDepth;
+    if (frame.flags & ~knownFlags)
+        return reject("coded frame with an undefined video flag bit (OMTVideoFlags defines 1/2/4/8/16)");
+    // The same family as the raw gate's lying-Alpha refusal: this path carries no alpha plane, is
+    // progressive, and MediaCodec on the phone codes 8-bit only. A claim here would be a header no
+    // payload can keep.
+    if (frame.flags & (VideoFlags::Interlaced | VideoFlags::Alpha | VideoFlags::PreMultiplied |
+                       VideoFlags::HighBitDepth))
+        return reject("coded frame claiming a flag its access unit cannot carry (this path is "
+                      "8-bit, progressive and has no alpha plane)");
+    return true;
+}
+
 int Sender::send(const MediaFrame& frame) {
     // One failure exit for everything the sender refuses to emit a payload for. b66ab347 added
     // lastError()/encodeFailures() precisely because a frame that left the camera and produced
@@ -757,9 +822,15 @@ int Sender::send(const MediaFrame& frame) {
     VideoExtHeader extHeader{};
     EncoderIdentity producer;
 
+    // OMT-HX: the caller already encoded the frame (MediaCodec on the phone), so the payload is
+    // passed through untouched and the tag says which codec made it. Everything else - the gate
+    // before the no-clients shortcut, the counters, the channel fan-out - is the same path.
+    const bool coded = isCodedCodec(frame.codec);
+
     // Runs BEFORE the no-clients shortcut, like the colour-space gate it absorbs: a frame the
     // buffer cannot honour is refused whether or not anyone is watching, so the device that would
-    // have crashed on air is refused on the bench instead.
+    // have crashed on air is refused on the bench instead. validateFrame() routes a coded frame to
+    // the Hx gate, so both paths are refused here, before a subscriber exists.
     if (!validateFrame(frame, why)) {
         // `why` is filled in; fall through to the shared failure exit.
     } else {
@@ -768,11 +839,20 @@ int Sender::send(const MediaFrame& frame) {
 
         if (connectionCount() == 0) return 1;  // No clients, but not an error
 
-        // Create/update encoder. A frame is only encoded against an encoder that really exists:
-        // the old code called this and ignored whether VMX_Create returned NULL.
-        if (createEncoder(frame.width, frame.height,
-                          frame.frameRateN / frame.frameRateD,
-                          frame.colorSpace, why)) {
+        if (coded) {
+            // Nothing to encode. The producer identity is the frame's own geometry and colour
+            // space, which is exactly what the header is allowed to declare about these bytes.
+            encodedLen = frame.dataLength;
+            havePayload = true;
+            producer.width = frame.width;
+            producer.height = frame.height;
+            producer.colorSpace = frame.colorSpace;
+            producer.valid = true;
+        } else if (createEncoder(frame.width, frame.height,
+                                 frame.frameRateN / frame.frameRateD,
+                                 frame.colorSpace, why)) {
+            // Create/update encoder. A frame is only encoded against an encoder that really exists:
+            // the old code called this and ignored whether VMX_Create returned NULL.
             // Encode frame. `producer` is the identity of the instance that made these bytes.
             encodedLen = encodeFrame(frame, &producer);
             havePayload = encodedLen > 0;
@@ -780,13 +860,17 @@ int Sender::send(const MediaFrame& frame) {
                 why = "encoder produced no payload (codec " +
                       std::to_string(frame.codec) + ", " + std::to_string(frame.width) + "x" +
                       std::to_string(frame.height) + ")";
-            } else if (!buildVideoHeaders(frame, producer, encodedLen, header, extHeader, why)) {
-                // The header would not match the payload. Counted and named like every other
-                // refusal below — a frame that leaves no picture behind must not leave no reason
-                // either.
-                havePayload = false;
-                encodedLen = 0;
             }
+        }
+
+        if (havePayload &&
+            !buildVideoHeaders(frame, producer, encodedLen, header, extHeader, why,
+                               coded ? frame.codec : Codec::VMX1)) {
+            // The header would not match the payload. Counted and named like every other
+            // refusal below — a frame that leaves no picture behind must not leave no reason
+            // either.
+            havePayload = false;
+            encodedLen = 0;
         }
     }
 
@@ -814,6 +898,9 @@ int Sender::send(const MediaFrame& frame) {
     // built apart from each other. Nothing below this line may re-derive a wire field from `frame`.
     
     // Send to all subscribed clients
+    // The payload pointer is chosen once, here: a coded frame's bytes are the caller's access unit,
+    // not the VMX encode buffer (which is empty on that path and would hand sendAsync a null).
+    const uint8_t* payload = coded ? static_cast<const uint8_t*>(frame.data) : encodeBuffer_.data();
     int totalSent = 0;
     {
         std::lock_guard<std::mutex> lock(channelsMutex_);
@@ -825,7 +912,7 @@ int Sender::send(const MediaFrame& frame) {
             
             int sent = ch->sendAsync(&header, sizeof(header),
                                      &extHeader, sizeof(extHeader),
-                                     encodeBuffer_.data(), encodedLen);
+                                     payload, encodedLen);
             if (sent > 0) {
                 totalSent += sent;
             }

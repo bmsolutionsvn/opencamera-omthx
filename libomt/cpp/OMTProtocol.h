@@ -62,6 +62,10 @@ struct AudioExtHeader {
 // Codec FourCC values
 namespace Codec {
     constexpr int32_t VMX1 = 0x31584D56;  // "VMX1"
+    // OMT-HX: the payload is one already-encoded access unit, and the tag says which codec made it.
+    // Same FourCCs as OMT-HX's libomt (src/codec.h: kCodecHevc/kCodecH264) and the public enum below.
+    constexpr int32_t HEVC = 0x43564548;  // "HEVC"
+    constexpr int32_t H264 = 0x34363248;  // "H264"
     constexpr int32_t UYVY = 0x59565955;  // "UYVY"
     constexpr int32_t YUY2 = 0x32595559;  // "YUY2"
     constexpr int32_t NV12 = 0x3231564E;  // "NV12"

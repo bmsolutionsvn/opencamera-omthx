@@ -289,7 +289,7 @@ private:
     // an encoder identity that disagree and watch the refusal happen (see the test seam above).
     static bool buildVideoHeaders(const MediaFrame& frame, const EncoderIdentity& encoder,
                                  int encodedLen, FrameHeader& outHeader, VideoExtHeader& outExt,
-                                 std::string& why);
+                                 std::string& why, int codec = Codec::VMX1);
     // VMX_ConfigureInterlaced (libvmx/src/vmxcodec.cpp:501-510) only switches to
     // VMX_FORMAT_INTERLACED at these heights; anywhere else it silently stays progressive, which is
     // why an Interlaced claim at another height is refused rather than advertised.
@@ -303,6 +303,9 @@ private:
     // device, with nothing in the log. This gate runs before the first allocation or VMX call.
     // (P0 #9 / P0 #16, from the desktop vendored sender.)
     static bool validateFrame(const MediaFrame& frame, std::string& why);
+    // The coded (OMT-HX) counterpart: an access unit that is already encoded has no stride, no VMX
+    // limits and no encoder, but it still may not advertise what its payload cannot carry.
+    static bool validateCodedFrame(const MediaFrame& frame, std::string& why);
     static size_t encodeBufferCapacity(int width, int height);
     // P0 #10: what VMX_SaveTo() is allowed to hand back for it to be published as a frame at all.
     static bool encodedLenAcceptable(int encodedLen, size_t capacity);

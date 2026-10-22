@@ -1939,6 +1939,35 @@ build_et et-mutant-chroma-offset fail "$ET7/OMTBridge.cpp"
 
 
 echo
+echo "== coded-send: an already-encoded frame passes through, tagged with its own codec =="
+build_and_run cs-hx "$ROOT/qa/coded-send.cpp" "$ROOT/libomt/cpp" pass
+
+HX1=$(fresh_copy mutant-hx-codec)
+if apply_mutant hx-mutant-codec "$HX1/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    ext.codec = codec;"
+assert s.count(old) == 1, "codec assignment in buildVideoHeaders not found"
+open(p, "w").write(s.replace(old, "    ext.codec = Codec::VMX1;  // MUTANT: tag every payload as VMX", 1))
+PY
+then build_and_run hx-mutant-codec "$ROOT/qa/coded-send.cpp" "$HX1" fail
+fi
+
+HX2=$(fresh_copy mutant-hx-geometry)
+if apply_mutant hx-mutant-geometry "$HX2/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = """            producer.width = frame.width;
+            producer.height = frame.height;"""
+assert s.count(old) == 1, "coded producer geometry not found"
+open(p, "w").write(s.replace(old, """            producer.width = 1920;   // MUTANT: geometry captured once, not per frame
+            producer.height = 1080;""", 1))
+PY
+then build_and_run hx-mutant-geometry "$ROOT/qa/coded-send.cpp" "$HX2" fail
+fi
+
+
+echo
 if [ "$HARNESS_ERR" -ne 0 ]; then
   echo "QA FAILED — the harness itself could not express every scenario (see QA HARNESS ERROR lines above)"
   [ ${#FAILED[@]} -gt 0 ] && echo "  failing scenarios: ${FAILED[*]}"
