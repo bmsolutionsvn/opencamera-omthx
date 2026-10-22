@@ -166,12 +166,13 @@ rate and say so.
 asynchronously, and `stopOmtStreaming()` calls `stopStreaming()` immediately after — a naive
 release would stop/release the MediaCodec input surface while Camera2 still targets it: the
 abandoned-BufferQueue crash this repo already documents for the ImageReader. The stop is
-sequenced behind camera detach instead: `Preview` gains
-`setOmtStreamingSurface(Surface, Runnable afterDetach)` (or an equivalent callback from
-`CameraController2` when the reopened session is configured without the OMT surface), and
-`stopOmtStreaming()` passes `stopStreaming` as that runnable. The drain thread is joined before
-the sender is torn down; `stopAll()` on activity destroy goes through the same path after the
-camera is closed. File list grows by `Preview.java` and `CameraController2.java`.
+sequenced behind camera detach instead: `Preview.setOmtStreamingSurface(Surface, Runnable afterDetach)`
+runs the runnable inside the existing `closeCamera(...)` `CloseCameraCallback.onClosed()`, before
+`openCamera()` — at that point the camera device is closed, so nothing targets the surface. The
+old single-argument method delegates with `null`. `stopOmtStreaming()` passes
+`omtStreamingManager::stopStreaming` as that runnable. The drain thread is joined before the
+sender is torn down; `stopAll()` on activity destroy goes through the same path after the camera
+is closed. File list: `Preview.java` and `MainActivity.java`; `CameraController2` is untouched.
 
 ### 4.5 Bitrate (a builder call, tunable)
 
