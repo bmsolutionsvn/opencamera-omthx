@@ -124,7 +124,7 @@
         android:padding="10dp"
         android:scaleType="fitCenter"
         android:contentDescription="@string/omt_streaming"
-        app:srcCompat="@drawable/ic_videocam_white_48dp"
+        app:srcCompat="@drawable/ic_omt_broadcast"
         android:stateListAnimator="@animator/button_animation"
         android:onClick="clickedOmtStreaming"
         android:background="@drawable/circle_background"

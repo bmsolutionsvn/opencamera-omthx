@@ -983,6 +983,16 @@ mutate_jni "$JB3" omtnv12.h \
   "stop refusing negative lengths by name"
 build_jni jb-mutant-no-negative fail "$JB3/OMTBridge.cpp"
 
+# JB4: the nanosecond-to-tick conversion dropped. The wire field is 100 ns ticks; handing it
+# microseconds makes every frame look 10x too close, which changes the pacing a receiver derives and
+# silences its gap detection. C1i is the only assertion that can see it.
+JB4=$(fresh_copy_jni mutant-jni-pts-units)
+mutate_jni "$JB4" OMTBridge.cpp \
+  '    frame.Timestamp = ptsNs / 100;' \
+  '    frame.Timestamp = ptsNs;  // MUTANT: microseconds on a 100 ns wire field' \
+  "drop the tick conversion on the coded path"
+build_jni jb-mutant-pts-units fail "$JB4/OMTBridge.cpp"
+
 # Channel scenarios, with the HEADERS taken from the same copy as the sources. build_and_run resolves
 # includes against the tree, which is fine while a mutant changes only .cpp; here the pre-fix copy
 # changes Channel's member layout (sendSocketMutex_ is a member), and a test built against the tree's
@@ -1936,6 +1946,35 @@ mutate_jni "$ET7" OMTBridge.cpp \
         const uintptr_t lo = std::min(ua, va);' \
   "copy the chroma pair apart and lose the address relationship"
 build_et et-mutant-chroma-offset fail "$ET7/OMTBridge.cpp"
+
+
+echo
+echo "== coded-send: an already-encoded frame passes through, tagged with its own codec =="
+build_and_run cs-hx "$ROOT/qa/coded-send.cpp" "$ROOT/libomt/cpp" pass
+
+HX1=$(fresh_copy mutant-hx-codec)
+if apply_mutant hx-mutant-codec "$HX1/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    ext.codec = codec;"
+assert s.count(old) == 1, "codec assignment in buildVideoHeaders not found"
+open(p, "w").write(s.replace(old, "    ext.codec = Codec::VMX1;  // MUTANT: tag every payload as VMX", 1))
+PY
+then build_and_run hx-mutant-codec "$ROOT/qa/coded-send.cpp" "$HX1" fail
+fi
+
+HX2=$(fresh_copy mutant-hx-geometry)
+if apply_mutant hx-mutant-geometry "$HX2/OMTSender.cpp" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = """            producer.width = frame.width;
+            producer.height = frame.height;"""
+assert s.count(old) == 1, "coded producer geometry not found"
+open(p, "w").write(s.replace(old, """            producer.width = 1920;   // MUTANT: geometry captured once, not per frame
+            producer.height = 1080;""", 1))
+PY
+then build_and_run hx-mutant-geometry "$ROOT/qa/coded-send.cpp" "$HX2" fail
+fi
 
 
 echo

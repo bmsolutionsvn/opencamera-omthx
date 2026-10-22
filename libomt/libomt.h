@@ -71,6 +71,8 @@ typedef enum OMTFrameType
 typedef enum OMTCodec
 {
     OMTCodec_VMX1 = 0x31584D56,
+    OMTCodec_HEVC = 0x43564548, //"HEVC" - OMT-HX: one already-encoded HEVC access unit
+    OMTCodec_H264 = 0x34363248, //"H264" - OMT-HX: one already-encoded H.264 access unit
     OMTCodec_FPA1 = 0x31415046, //Planar audio
     OMTCodec_UYVY = 0x59565955,
     OMTCodec_YUY2 = 0x32595559,

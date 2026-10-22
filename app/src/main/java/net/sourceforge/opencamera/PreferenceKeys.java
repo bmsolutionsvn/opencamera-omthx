@@ -416,4 +416,7 @@ public class PreferenceKeys {
     public static final String OmtStreamingQualityKey = "preference_omt_streaming_quality";
     public static final String OmtStreamingNameKey = "preference_omt_streaming_name";
     public static final String OmtAutoStartKey = "preference_omt_auto_start";
+    // Full = the existing VMX stream; hx = OMT HX (HEVC/H.264 access units from MediaCodec).
+    public static final String OmtStreamingModeKey = "preference_omt_streaming_mode";
+    public static final String OmtHxCodecKey = "preference_omt_streaming_hx_codec";
 }

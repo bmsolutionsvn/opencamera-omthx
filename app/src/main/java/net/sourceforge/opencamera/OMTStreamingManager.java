@@ -3,6 +3,7 @@ package net.sourceforge.opencamera;
 import android.graphics.ImageFormat;
 import android.media.Image;
 import android.media.ImageReader;
+import android.media.MediaFormat;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Log;
@@ -67,6 +68,11 @@ public class OMTStreamingManager {
     private final StreamingCallback callback;
     private OMTSender omtSender;
     private ImageReader imageReader;
+    private OMTHXEncoder hxEncoder;   // non-null only while an HX stream is running
+    private int streamingWidth;
+    private int streamingHeight;
+    private int streamingFps;
+    private String streamingCodecLabel = "VMX";   // "VMX", "HEVC" or "H.264", for the status line
     private HandlerThread backgroundThread;
     private Handler backgroundHandler;
 
@@ -207,12 +213,28 @@ public class OMTStreamingManager {
      * @return true if streaming started successfully
      */
     public synchronized boolean startStreaming(int width, int height, int fps, int quality, String name) {
+        return startStreaming(width, height, fps, quality, name, "full", null);
+    }
+
+    /**
+     * Start OMT video streaming in one of two modes.
+     *
+     * "full" keeps the existing path: Camera2 into an ImageReader, VMX in libomt.
+     * "hx" (OMT HX) hands the camera the MediaCodec input surface instead, and the encoder's
+     * access units go straight to the sender - H.265/H.264, hardware encoded, no VMX.
+     *
+     * @param mode  "full" or "hx"
+     * @param mime  the encoder MIME for HX ("video/hevc" or "video/avc"); ignored for Full
+     */
+    public synchronized boolean startStreaming(int width, int height, int fps, int quality, String name,
+                                               String mode, String mime) {
         if (isStreaming) {
             Log.w(TAG, "Already streaming");
             return true;
         }
 
-        Log.i(TAG, "Starting OMT streaming: " + width + "x" + height + "@" + fps + "fps, quality=" + quality);
+        Log.i(TAG, "Starting OMT streaming: " + width + "x" + height + "@" + fps + "fps, quality=" + quality
+                + ", mode=" + mode + (mime != null ? (" (" + mime + ")") : ""));
 
         // If not already announcing, start announcement first
         if (!isAnnouncing) {
@@ -222,19 +244,41 @@ public class OMTStreamingManager {
         }
 
         try {
-            // Create ImageReader for frame capture
-            imageReader = ImageReader.newInstance(
-                    width, height,
-                    ImageFormat.YUV_420_888,
-                    3 // Max images in the queue — and the reason the callback must be cheap: the
-                      // camera cannot recycle a buffer until onImageAvailable returns, so the cost
-                      // of that callback is the delivered frame rate. It queues into the bridge's
-                      // encoder ring (same depth, app/src/main/cpp/OMTBridge.cpp) and returns.
-            );
-            imageReader.setOnImageAvailableListener(imageListener, backgroundHandler);
+            if ("hx".equals(mode) && mime != null) {
+                final boolean hevc = MediaFormat.MIMETYPE_VIDEO_HEVC.equals(mime);
+                final int bitrate = OMTHXFormat.bitrate(width, height, fps, quality, hevc);
+                final int codecTag = hevc ? OMTSender.CODEC_HEVC : OMTSender.CODEC_H264;
+                hxEncoder = new OMTHXEncoder(mime, codecTag, width, height, fps, bitrate);
+                hxEncoder.start((data, offset, length, tag, w, h, fpsN, fpsD, ptsNs, keyframe) -> {
+                    final OMTSender sender = omtSender;
+                    if (sender != null) {
+                        sender.sendCoded(data, offset, length, tag, w, h, fpsN, fpsD, ptsNs);
+                    }
+                });
+                Log.i(TAG, "OMT HX encoder started: " + width + "x" + height + "@" + fps + " " + mime
+                        + " at " + OMTHXFormat.bitrate(width, height, fps, quality,
+                        MediaFormat.MIMETYPE_VIDEO_HEVC.equals(mime)) + " bps");
+            } else {
+                // Create ImageReader for frame capture
+                imageReader = ImageReader.newInstance(
+                        width, height,
+                        ImageFormat.YUV_420_888,
+                        3 // Max images in the queue — and the reason the callback must be cheap: the
+                          // camera cannot recycle a buffer until onImageAvailable returns, so the cost
+                          // of that callback is the delivered frame rate. It queues into the bridge's
+                          // encoder ring (same depth, app/src/main/cpp/OMTBridge.cpp) and returns.
+                );
+                imageReader.setOnImageAvailableListener(imageListener, backgroundHandler);
+            }
 
+            streamingWidth = width;
+            streamingHeight = height;
+            streamingFps = fps;
+            streamingCodecLabel = ("hx".equals(mode) && mime != null)
+                    ? (MediaFormat.MIMETYPE_VIDEO_HEVC.equals(mime) ? "HEVC" : "H.264")
+                    : "VMX";
             isStreaming = true;
-            Log.i(TAG, "OMT streaming started - camera frames will be sent");
+            Log.i(TAG, "OMT streaming started - frames will be sent");
 
             if (callback != null) {
                 callback.onStreamingStarted();
@@ -250,6 +294,16 @@ public class OMTStreamingManager {
             }
             return false;
         }
+    }
+
+    /** The geometry actually in use: {width, height, fps} after any encoder clamp. */
+    public synchronized int[] getStreamingGeometry() {
+        return new int[]{streamingWidth, streamingHeight, streamingFps};
+    }
+
+    /** "VMX", "HEVC" or "H.264": what the running stream is carrying, for the status line. */
+    public synchronized String getStreamingCodecLabel() {
+        return streamingCodecLabel;
     }
 
     /**
@@ -277,7 +331,9 @@ public class OMTStreamingManager {
         isStreaming = false;
         isAnnouncing = false;
         unregisterService();
-        cleanup();
+        // The activity is going away while Preview.onPause/onDestroy closes the camera
+        // asynchronously: do NOT close the encoder surface from here.
+        cleanup(false);
 
         if (callback != null) {
             callback.onStreamingStopped();
@@ -291,6 +347,9 @@ public class OMTStreamingManager {
      * @return Surface for frame capture, or null if not streaming
      */
     public Surface getStreamingSurface() {
+        if (hxEncoder != null) {
+            return hxEncoder.getInputSurface();
+        }
         return imageReader != null ? imageReader.getSurface() : null;
     }
 
@@ -621,6 +680,10 @@ public class OMTStreamingManager {
      * Cleanup streaming only (ImageReader), keep OMT sender and mDNS active.
      */
     private void cleanupStreaming() {
+        cleanupStreaming(true);
+    }
+
+    private void cleanupStreaming(boolean releaseEncoderSurface) {
         // Release ImageReader only.
         //
         // THE FAILURE THIS PREVENTS. The reader used to be closed right here, on the main thread,
@@ -647,6 +710,15 @@ public class OMTStreamingManager {
         // Each step keeps its own try/catch and the field is nulled first, mirroring the per-resource
         // discipline unregisterService() documents: one step throwing must not jump the rest, and
         // getStreamingSurface() must never hand out a Surface whose reader is being torn down.
+        final OMTHXEncoder encoder = hxEncoder;
+        hxEncoder = null;
+        if (encoder != null) {
+            // The camera has already detached from this surface (Preview runs stopStreaming from its
+            // CloseCameraCallback.onClosed), so releasing the codec here cannot pull the surface out
+            // from under a live capture session. This joins the drain thread.
+            encoder.stop(releaseEncoderSurface);
+        }
+
         final ImageReader reader = imageReader;
         if (reader == null) {
             return;
@@ -726,7 +798,16 @@ public class OMTStreamingManager {
      * Full cleanup - both streaming and announcement.
      */
     private void cleanup() {
-        cleanupStreaming();
+        cleanup(true);
+    }
+
+    /**
+     * @param releaseEncoderSurface false when the camera may still be closing (activity destroy:
+     *        the close is asynchronous, so closing the MediaCodec surface here would pull it out
+     *        from under a live session). The surface then goes with the process.
+     */
+    private void cleanup(boolean releaseEncoderSurface) {
+        cleanupStreaming(releaseEncoderSurface);
         cleanupAnnouncement();
     }
 

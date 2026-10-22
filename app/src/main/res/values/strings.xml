@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <string name="app_name">Open Camera OMT</string> <!-- Modified version with OMT streaming - shouldn't be translated, unless deemed appropriate e.g. alternative alphabets -->
+    <string name="app_name">Bread OMT Camera</string> <!-- distinct from other Open Camera builds so both can be installed and told apart in the launcher -->
     <string name="action_settings">Settings</string>
     <string name="action_popup">Popup settings</string>
     <string name="intro_ok">OK (This message won\'t show again)</string>

@@ -182,6 +182,31 @@
             />
 
         <ListPreference
+            android:key="preference_omt_streaming_mode"
+            android:title="Streaming Mode"
+            android:summary="Full is the VMX stream; OMT HX sends H.265/H.264 from the phone's encoder"
+            android:entries="@array/preference_omt_mode_entries"
+            android:entryValues="@array/preference_omt_mode_values"
+            android:defaultValue="full"
+            android:dependency="preference_omt_streaming_enabled"
+            />
+
+        <ListPreference
+            android:key="preference_omt_streaming_hx_codec"
+            android:title="HX Codec"
+            android:entries="@array/preference_omt_hx_codec_entries"
+            android:entryValues="@array/preference_omt_hx_codec_values"
+            android:defaultValue="hevc"
+            />
+
+        <ListPreference
+            android:key="preference_omt_stream_fps"
+            android:title="Stream Frame Rate"
+            android:summary="Camera frame rate used by the stream (same setting as Video settings)"
+            android:dependency="preference_omt_streaming_enabled"
+            />
+
+        <ListPreference
             android:key="preference_omt_streaming_quality"
             android:title="Streaming Quality"
             android:summary="Low recommended for WiFi stability"

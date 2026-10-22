@@ -44,6 +44,9 @@ import android.hardware.SensorEventListener;
 import android.hardware.SensorManager;
 import android.hardware.display.DisplayManager;
 import android.media.MediaMetadataRetriever;
+import android.media.MediaCodecInfo;
+import android.media.MediaCodecList;
+import android.media.MediaFormat;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -164,6 +167,7 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
 
     // OMT Network Streaming
     private OMTStreamingManager omtStreamingManager; // may be null - created when enabled in settings
+    private boolean omtStopPending; // a stop is waiting for the camera to release the OMT surface
 
     // private boolean ui_placement_right = true;
 
@@ -2318,6 +2322,15 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         if (MyDebug.LOG)
             Log.d(TAG, "clickedOmtStreaming");
 
+        // Between "stop" and the camera's close callback the surface is still owned by the session.
+        // A tap in that window must not restart (or re-stop) against a surface that is about to be
+        // released - that is the abandoned-BufferQueue death the ordering exists to prevent.
+        if (omtStopPending) {
+            if (MyDebug.LOG)
+                Log.d(TAG, "OMT stop is still waiting for the camera to close - ignoring tap");
+            return;
+        }
+
         if (omtStreamingManager != null && omtStreamingManager.isStreaming()) {
             // Stop streaming
             stopOmtStreaming();
@@ -2496,6 +2509,9 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         // Get streaming settings
         String streamName = applicationInterface.getOmtStreamingName();
         int quality = applicationInterface.getOmtStreamingQuality();
+        SharedPreferences omtPrefs = PreferenceManager.getDefaultSharedPreferences(this);
+        final String omtMode = omtPrefs.getString(PreferenceKeys.OmtStreamingModeKey, "full");
+        final String omtHxCodec = omtPrefs.getString(PreferenceKeys.OmtHxCodecKey, "hevc");
 
         // Get current video profile for resolution and fps
         VideoProfile profile = preview.getVideoProfile();
@@ -2503,8 +2519,53 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         int height = profile.videoFrameHeight;
         int fps = profile.videoCaptureRate > 0 ? (int) profile.videoCaptureRate : 30;
 
+        // HX: keep the profile's size when the encoder can do it, otherwise the largest size/rate the
+        // device really supports (up to 4K120). Full mode keeps the profile untouched.
+        String hxMime = null;
+        if ("hx".equals(omtMode)) {
+            // CameraController2 leaves the OMT surface out of every high-speed capture session
+            // (`want_video_high_speed`), so an HX request at 120/240 fps would start "successfully"
+            // and then produce nothing at all. Say so instead of showing a red button over a black
+            // receiver.
+            if (preview.isVideoHighSpeed()) {
+                preview.showToast(null,
+                        "OMT HX cannot use a high-speed video profile - choose 60 fps or lower in Video settings",
+                        true);
+                return;
+            }
+            hxMime = pickOmtHxMime("hevc".equals(omtHxCodec));
+            if (hxMime == null) {
+                preview.showToast(null, "This device has no hardware H.265 or H.264 encoder", true);
+                return;
+            }
+            final MediaCodecInfo.VideoCapabilities caps = omtVideoCapabilities(hxMime);
+            if (caps == null) {
+                preview.showToast(null, "Cannot read the encoder's capabilities", true);
+                return;
+            }
+            OMTHXFormat.Limits limits = (w, h) -> {
+                if (!caps.isSizeSupported(w, h)) {
+                    return 0;
+                }
+                try {
+                    return (int) Math.floor(caps.getSupportedFrameRatesFor(w, h).getUpper());
+                } catch (IllegalArgumentException e) {
+                    return 0;
+                }
+            };
+            int[] chosen = OMTHXFormat.choose(width, height, fps, omtCameraSizes(), limits);
+            if (chosen == null) {
+                preview.showToast(null, "The encoder supports none of this device's video sizes", true);
+                return;
+            }
+            width = chosen[0];
+            height = chosen[1];
+            fps = chosen[2];
+        }
+
         if (MyDebug.LOG) {
-            Log.d(TAG, "OMT stream: " + width + "x" + height + "@" + fps + "fps, quality=" + quality);
+            Log.d(TAG, "OMT stream: " + width + "x" + height + "@" + fps + "fps, quality=" + quality
+                    + ", mode=" + omtMode + (hxMime != null ? " (" + hxMime + ")" : ""));
         }
 
         // Ensure streaming manager exists (may have been created by auto-announcement)
@@ -2514,11 +2575,76 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
 
         // Start streaming (will use existing announcement if available)
         if (omtStreamingManager != null
-                && !omtStreamingManager.startStreaming(width, height, fps, quality, streamName)) {
+                && !omtStreamingManager.startStreaming(width, height, fps, quality, streamName, omtMode, hxMime)) {
             preview.showToast(null, R.string.omt_streaming_failed, true);
         } else if (omtStreamingManager != null) {
             preview.setOmtStreamingSurface(omtStreamingManager.getStreamingSurface());
         }
+    }
+
+    /** The HX encoder MIME for the requested codec, falling back to the other one this device has. */
+    private String pickOmtHxMime(boolean wantHevc) {
+        boolean hasHevc = false;
+        boolean hasAvc = false;
+        MediaCodecList codecList = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+        for (MediaCodecInfo info : codecList.getCodecInfos()) {
+            if (!info.isEncoder()) {
+                continue;
+            }
+            for (String type : info.getSupportedTypes()) {
+                if (MediaFormat.MIMETYPE_VIDEO_HEVC.equalsIgnoreCase(type)) {
+                    hasHevc = true;
+                } else if (MediaFormat.MIMETYPE_VIDEO_AVC.equalsIgnoreCase(type)) {
+                    hasAvc = true;
+                }
+            }
+        }
+        if (wantHevc && hasHevc) {
+            return MediaFormat.MIMETYPE_VIDEO_HEVC;
+        }
+        if (hasAvc) {
+            return MediaFormat.MIMETYPE_VIDEO_AVC;
+        }
+        return hasHevc ? MediaFormat.MIMETYPE_VIDEO_HEVC : null;
+    }
+
+    private MediaCodecInfo.VideoCapabilities omtVideoCapabilities(String mime) {
+        MediaCodecList codecList = new MediaCodecList(MediaCodecList.REGULAR_CODECS);
+        for (MediaCodecInfo info : codecList.getCodecInfos()) {
+            if (!info.isEncoder()) {
+                continue;
+            }
+            for (String type : info.getSupportedTypes()) {
+                if (mime.equalsIgnoreCase(type)) {
+                    try {
+                        return info.getCapabilitiesForType(type).getVideoCapabilities();
+                    } catch (IllegalArgumentException e) {
+                        Log.w(TAG, "no video capabilities for " + type, e);
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /** The camera's video sizes as {width, height} pairs (the profile's size when it cannot be read). */
+    private int[][] omtCameraSizes() {
+        java.util.List<CameraController.Size> sizes = null;
+        try {
+            sizes = preview.getVideoQualityHander().getSupportedVideoSizes();
+        } catch (Exception e) {
+            Log.w(TAG, "cannot read the camera's video sizes", e);
+        }
+        if (sizes == null || sizes.isEmpty()) {
+            VideoProfile profile = preview.getVideoProfile();
+            return new int[][]{{profile.videoFrameWidth, profile.videoFrameHeight}};
+        }
+        int[][] out = new int[sizes.size()][2];
+        for (int i = 0; i < sizes.size(); ++i) {
+            out[i][0] = sizes.get(i).width;
+            out[i][1] = sizes.get(i).height;
+        }
+        return out;
     }
 
     /**
@@ -2529,10 +2655,15 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             Log.d(TAG, "stopOmtStreaming");
 
         if (omtStreamingManager != null) {
-            // Remove surface from camera (reopens camera without OMT surface)
-            preview.setOmtStreamingSurface(null);
-            // Stop streaming but keep announcement active
-            omtStreamingManager.stopStreaming();
+            // The encoder surface (HX) must be released only after Camera2 has closed its session,
+            // so stopStreaming runs from the detach callback rather than immediately after the call:
+            // a MediaCodec surface released while still targeted kills the process. The flag keeps a
+            // second tap from starting or stopping against that in-between state.
+            omtStopPending = true;
+            preview.setOmtStreamingSurface(null, () -> {
+                omtStreamingManager.stopStreaming();
+                omtStopPending = false;
+            });
             // Don't set to null - keep announcement active
         }
         updateOmtStreamingUI(false);
@@ -2560,6 +2691,15 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             if (isStreaming && preview != null) {
                 try {
                     textView.setVisibility(View.VISIBLE);
+                    String codecLabel = omtStreamingManager != null
+                            ? omtStreamingManager.getStreamingCodecLabel() : "VMX";
+                    if (!"VMX".equals(codecLabel)) {
+                        // HX: what the encoder is really producing, after the capability clamp.
+                        int[] geometry = omtStreamingManager.getStreamingGeometry();
+                        textView.setText("HX " + codecLabel + " | " + geometry[0] + "x" + geometry[1]
+                                + " | " + geometry[2] + "fps");
+                        return;
+                    }
                     net.sourceforge.opencamera.preview.VideoProfile profile = preview.getVideoProfile();
                     int width = profile.videoFrameWidth;
                     int height = profile.videoFrameHeight;

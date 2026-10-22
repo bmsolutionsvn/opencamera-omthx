@@ -5,6 +5,26 @@ listed rather than silently patched because several change app behaviour or
 require a device to validate, and one is upstream Open Camera code rather than
 OMT code.
 
+## OMT HX (v1 limits, by design)
+
+- **No audio.** The app has never sent audio; HX is video only.
+- **No alpha, no 10-bit.** The coded path is 8-bit 4:2:0 progressive, and the
+  sender refuses an access unit that claims otherwise.
+- **No incoming keyframe request handling.** A lost frame is recovered by the
+  next 1 s IDR rather than an on-demand keyframe. On a flaky link, lower the
+  frame rate or use Full mode if that recovery window is too long.
+- **No preview/multiview stream.** A receiver asking for one gets program only.
+- **No high-speed video profiles.** `CameraController2` leaves the OMT surface out of any
+  high-speed capture session, so HX refuses to start (with a toast) when the current video profile
+  is 120/240 fps. Pick 60 fps or lower. The clamp to "up to 4K120" therefore means up to 4K at the
+  highest rate the device offers in a *normal* session.
+- **No live re-clamp.** Encoder capabilities can shrink under thermal load; the
+  stream keeps the geometry chosen at start. Restart streaming if the device
+  throttles.
+- **The announcement still advertises the video profile's geometry**, which can
+  differ from the clamped HX geometry (mDNS metadata only; the frames carry
+  their own size).
+
 ## Lifecycle / streaming
 
 1. **No foreground service behind the stream.**

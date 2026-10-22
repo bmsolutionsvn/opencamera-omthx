@@ -12,6 +12,29 @@ In addition to all standard Open Camera features:
 - Quality presets: Low (~43 Mbps), Medium (~100 Mbps), High (~130 Mbps) at 1080p30
 - Support for 720p, 1080p, and 4K resolutions
 - Real-time frame drop monitoring
+- **OMT HX streaming**: H.265 (HEVC) or H.264 encoded by the phone's hardware encoder, at a
+  fraction of VMX's bandwidth, selectable beside the Full/VMX mode
+
+## Streaming modes
+
+Settings → Video settings → OMT Network Streaming → **Streaming Mode**:
+
+| Mode | What it sends | Receiver |
+|---|---|---|
+| **Full (VMX)** | VMX intra-frame, 43–130 Mbps at 1080p30 | Any OMT receiver (OBS plugin, libomtnet, `omthx-recv`) |
+| **OMT HX** | H.265/H.264 access units from the phone's MediaCodec encoder, ~4–150 Mbps depending on size/rate/quality | HX-capable only: the OBS `omtplugin` with OMT-HX, or `omthx-recv` |
+
+HX notes:
+
+- Geometry follows the current video profile and is clamped to what the encoder really supports;
+  the status line shows the geometry actually in use. High-speed (120/240 fps) video profiles are
+  not supported in HX mode — the camera does not offer the OMT surface in a high-speed session, so
+  the app says so instead of streaming nothing.
+- H.265 is used when the device has an HEVC encoder, otherwise it falls back to H.264.
+- Quality selects the bitrate: roughly 0.06/0.10/0.15 bits per pixel per frame for Low/Medium/High.
+- A Full-only receiver shows no picture in HX mode. That is expected — the mode is explicit.
+- HX sends no audio, no alpha and no multiview/preview stream, and an IDR every second is the
+  recovery point if a frame is lost.
 
 ## Requirements
 

@@ -190,6 +190,9 @@ jboolean Java_net_sourceforge_opencamera_OMTSender_nativeSendFramePlanes(
         jobject uBuffer, jint uSize, jint uRowStride, jint uPixelStride,
         jobject vBuffer, jint vSize, jint vRowStride, jint vPixelStride,
         jint width, jint height);
+jboolean Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+        JNIEnv*, jobject, jobject buffer, jint offset, jint length, jint codec,
+        jint width, jint height, jint frameRateN, jint frameRateD, jlong ptsNs);
 }
 
 /* ------------------------------------------------------------------ *
@@ -467,6 +470,63 @@ int main() {
                       + std::to_string(sender->getStats().totalBytesSent) + ")");
         ok(sender->encodeFailures() == 0, "D3 with no encode failures, so the counter keeps meaning what it says"
                                           "   [failures=" + std::to_string(sender->encodeFailures()) + "]");
+    }
+
+    /* ---------------- C: the coded (OMT-Hx) entry point ----------------
+     * Java posts one already-encoded access unit per frame. The bridge must hand the sender exactly
+     * that buffer with the caller's geometry, and turn the nanosecond PTS into the 100 ns ticks the
+     * OMT header carries - a microsecond timestamp makes every frame look 10x too close, which no
+     * same-process test can notice unless it asks for the number. */
+    {
+        std::vector<uint8_t> au(2048);
+        for (size_t i = 0; i < au.size(); ++i) au[i] = (uint8_t)(i * 13 + 5);
+        jobject handle = makeHandle(au, 0, au.size());
+        const int64_t ptsNs = 1500000000LL;
+
+        const int sendsBefore = g_sendCalls;
+        const jboolean accepted = Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+                &env, nullptr, handle, 0, (jint)au.size(), OMTCodec_HEVC, 128, 72, 30, 1, ptsNs);
+        ok(accepted == JNI_TRUE, "C1 a coded HEVC access unit is accepted");
+        ok(g_sendCalls == sendsBefore + 1, "C1b and reached omt_send exactly once");
+        ok(g_lastFrame.codec == Codec::HEVC, "C1c tagged 'HEVC'");
+        ok(g_lastFrame.width == 128 && g_lastFrame.height == 72,
+           "C1d geometry is the caller's (128x72), not a value captured at init");
+        ok(g_lastFrame.frameRateN == 30 && g_lastFrame.frameRateD == 1,
+           "C1e rate is the caller's (30/1)");
+        ok(g_lastFrame.aspectRatio == 128.0f / 72.0f, "C1f aspect is width/height");
+        ok(g_lastFrame.flags == OMTVideoFlags_None, "C1g no flags are claimed");
+        ok(g_lastFrame.colorSpace == ColorSpace::BT601, "C1h a 72-line frame is 601, like the raw path");
+        ok(g_lastFrame.timestamp == ptsNs / 100, "C1i nanoseconds became 100 ns ticks");
+        ok(g_lastFrame.dataLength == (int)au.size(), "C1j the whole access unit is the payload");
+        ok(g_lastFrame.data == static_cast<void*>(reinterpret_cast<FakeBuf*>(handle)->bytes.data()),
+           "C1k the payload points at the caller's buffer");
+        ok(g_lastFrame.data != nullptr && memcmp(g_lastFrame.data, au.data(), au.size()) == 0,
+           "C1l and its bytes are the access unit's");
+
+        Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+                &env, nullptr, handle, 0, (jint)au.size(), OMTCodec_H264, 1920, 1080, 60, 1, ptsNs);
+        ok(g_lastFrame.codec == OMTCodec_H264, "C2 an H.264 access unit keeps its own tag");
+        ok(g_lastFrame.colorSpace == ColorSpace::BT709, "C2b and 1080 lines is 709");
+
+        const int beforeBad = g_sendCalls;
+        ok(Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+                   &env, nullptr, handle, 0, (jint)au.size() + 1, OMTCodec_HEVC, 64, 64, 30, 1, ptsNs)
+                   == JNI_FALSE, "C3 a length one past the capacity is refused");
+        ok(g_sendCalls == beforeBad, "C3b nothing reached the sender");
+        ok(has(g_log, "capacity"), "C3c and the log names the capacity it checked");
+        ok(Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+                   &env, nullptr, handle, 1, (jint)au.size(), OMTCodec_HEVC, 64, 64, 30, 1, ptsNs)
+                   == JNI_FALSE, "C4 an offset that pushes the end past the capacity is refused");
+        ok(Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+                   &env, nullptr, handle, 0, 0, OMTCodec_HEVC, 64, 64, 30, 1, ptsNs) == JNI_FALSE,
+           "C5 an empty access unit is refused");
+        ok(Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+                   &env, nullptr, handle, 0, (jint)au.size(), 0x12345678, 64, 64, 30, 1, ptsNs)
+                   == JNI_FALSE, "C6 a tag that is neither HEVC nor H264 is refused");
+        ok(Java_net_sourceforge_opencamera_OMTSender_nativeSendCoded(
+                   &env, nullptr, handle, 0, (jint)au.size(), OMTCodec_HEVC, 64, 64, 30, 0, ptsNs)
+                   == JNI_FALSE, "C7 frameRateD 0 is refused (the receiver divides the timeline by it)");
+        ok(g_sendCalls == beforeBad, "C8 none of the refused frames reached the sender");
     }
 
     Java_net_sourceforge_opencamera_OMTSender_nativeCleanup(&env, nullptr);
