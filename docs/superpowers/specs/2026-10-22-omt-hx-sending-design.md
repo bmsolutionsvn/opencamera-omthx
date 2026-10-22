@@ -9,7 +9,8 @@ Owner: bmsolutionsvn.
 The phone sends its camera to a PC over OMT-HX (HEVC or H.264 inside an ordinary OMT stream,
 the "High Efficiency" mode that `OMT-HX` and the OBS `omtplugin` already speak), while the
 existing Full (VMX) mode stays available. Owner decision: **HX sits beside Full as a Mode
-setting**, not a replacement.
+setting**, not a replacement. Resolution and frame rate follow the device, from small sizes up
+to 4K120 — nothing is pinned to 1080p30.
 
 The PC end is done and verified: `omtplugin` in OBS and `omthx-recv` both receive HX today.
 This design is only about the phone sending it.
@@ -61,7 +62,7 @@ Camera2 session ──▶ ImageReader(YUV_420_888)        OMTStreamingManager.ja
 - `validateFrame()` refuses any codec other than BGRA/UYVY/YUY2/NV12 ("this sender encodes
   BGRA/UYVY/YUY2/NV12 only"). This is the gate HX has to pass.
 
-## 4. The change, in four parts
+## 4. The change
 
 ### 4.1 libomt C++ sender: pass coded frames through
 
@@ -86,15 +87,53 @@ The receiver needs no change: it already switches on the codec tag.
 
 File: `app/src/main/cpp/OMTBridge.cpp`.
 
-`nativeSendCoded(byte[] data, int length, int codec, long ptsUs)` fills an `OMTMediaFrame`
-(Type=Video, Codec=tag, Data, DataLength, Width/Height/FrameRate from the existing globals,
-Stride=Width, ColorSpace, Flags=0, Timestamp=ptsUs) and calls `omt_send` on `g_sender` under
-`g_senderMutex`. The existing init/announce/tally/stats calls are reused untouched.
-`frameRateD == 0` is refused (the fork's own rule).
+`nativeSendCoded(byte[] data, int length, int codec, int width, int height, int fpsN, int fpsD,
+long ptsNs)` fills an `OMTMediaFrame` (Type=Video, Codec=tag, Data, DataLength,
+Width/Height/FrameRate **from the argument, not from the globals**, Stride=Width,
+AspectRatio=width/(float)height, ColorSpace, Flags=0, Timestamp=ptsNs/100) and calls `omt_send`
+on `g_sender` under `g_senderMutex`.
+
+Two details that are easy to get wrong here:
+
+- **Geometry travels with each frame.** The bridge's `g_width`/`g_height`/`g_frameRateN` are set
+  only by `nativeInit`, which runs at announcement time and is skipped while already announcing.
+  The stream is started later from `preview.getVideoProfile()`, so after a resolution or fps
+  change the globals can be stale while the access units are the new size. OMT-HX compares the
+  decoded picture against the header and treats a mismatch as a decode error (silent black
+  stream), so the coded path must never take geometry from the globals.
+- **The wire timestamp is 100 ns ticks**, not microseconds: `FrameHeader.timestamp` is in
+  100 ns units and the existing `postFrame()` writes `ns/100`. MediaCodec reports
+  `presentationTimeUs`, so the JVM side passes `presentationTimeUs * 1000` and the JNI divides
+  by 100. Passing microseconds straight through makes every frame look 10× too close and breaks
+  the receiver's gap detection.
+
+The existing init/announce/tally/stats calls are reused untouched. `frameRateD == 0` is refused
+(the fork's own rule).
 
 ### 4.3 Java: MediaCodec encoder
 
 New file `app/src/main/java/net/sourceforge/opencamera/OMTHXEncoder.java`.
+
+**Geometry: whatever the device and the profile allow, up to 4K120 — nothing is pinned to
+1080p30.** The target comes from the video profile the app already uses
+(`preview.getVideoProfile()` in `MainActivity`): device-derived, user-selectable, and already
+carries high-speed rates. The encoder then clamps it, in this order:
+
+1. `MediaCodecInfo.VideoCapabilities.areSizeAndRateSupported(w, h, fps)` — if yes, use it.
+2. Otherwise the highest rate the codec supports at (w, h) (`getSupportedFrameRatesFor`).
+3. Otherwise the largest size the codec supports at the requested rate
+   (`getSupportedWidths()`/`getSupportedHeights()`), then that size at its own highest rate.
+4. The size must also be a camera output size for a surface target
+   (`StreamConfigurationMap.getOutputSizes(SurfaceTexture.class)`); otherwise step down.
+5. HEVC first; the same clamping on H.264 if the device has no HEVC encoder; if neither accepts
+   even a modest size, refuse the start with a message and leave Full available.
+
+The geometry actually chosen is passed to `nativeSendCoded` per frame and shown in the status
+text, so a clamped stream is visible instead of silently wrong. Rates above 60 fps need a
+Camera2 constrained high-speed session; the app already picks high-speed profiles for those
+rates, and a MediaCodec input surface is one of the targets such a session allows. If the device
+refuses the high-speed session with the encoder surface, fall back to the highest non-high-speed
+rate and say so.
 
 - `MediaCodec.createEncoderByType("video/hevc")`, falling back to `"video/avc"` when the device
   has no HEVC encoder (`MediaCodecList` check before creating).
@@ -120,21 +159,35 @@ New file `app/src/main/java/net/sourceforge/opencamera/OMTHXEncoder.java`.
   `stopStreaming`/`stopAll`/`cleanup` stop whichever is active. The existing
   `reopenCamera()` path already handles swapping the surface in and out.
 - `MainActivity`: read the two preferences where it already reads quality/name, pass them to
-  `startStreaming`, and show the mode in the existing status text (`omt_status_text`).
+  `startStreaming`, and show the mode and the chosen geometry in the existing status text
+  (`omt_status_text`).
+
+**Stop ordering matters.** `Preview.setOmtStreamingSurface(null)` reopens the camera
+asynchronously, and `stopOmtStreaming()` calls `stopStreaming()` immediately after — a naive
+release would stop/release the MediaCodec input surface while Camera2 still targets it: the
+abandoned-BufferQueue crash this repo already documents for the ImageReader. The stop is
+sequenced behind camera detach instead: `Preview` gains
+`setOmtStreamingSurface(Surface, Runnable afterDetach)` (or an equivalent callback from
+`CameraController2` when the reopened session is configured without the OMT surface), and
+`stopOmtStreaming()` passes `stopStreaming` as that runnable. The drain thread is joined before
+the sender is torn down; `stopAll()` on activity destroy goes through the same path after the
+camera is closed. File list grows by `Preview.java` and `CameraController2.java`.
 
 ### 4.5 Bitrate (a builder call, tunable)
 
 There is no encoder-quality knob in HX — only a bitrate. Reuse the existing OMT quality preset
-so the UI does not grow another control:
+so the UI does not grow another control, but scale by pixels *and* frames, because a 1080p30
+table would starve 4K120:
 
 ```
-bitrate = base[quality] * (width * height * fps) / (1920 * 1080 * 30)
-base: Default/Low 8 Mbps, Medium 20 Mbps, High 40 Mbps   (HEVC, CBR)
+bitrate = width * height * fps * bpp[quality]      (HEVC, CBR)
+bpp: Low 0.06, Medium (and Default) 0.10, High 0.15
 H.264: x1.6
+clamped to 4..250 Mbps
 ```
 
-Clamped to 2..100 Mbps. One constant table in `OMTHXEncoder`, easy to change after the first
-measurement.
+Examples: 1080p30 = 3.7 / 6.2 / 9.3 Mbps; 4K60 = 30 / 50 / 75; 4K120 = 60 / 100 / 150.
+One constant table in `OMTHXEncoder`, easy to change after the first measurement.
 
 ## 5. Non-goals for v1
 
@@ -151,9 +204,12 @@ measurement.
 
 1. **Host, no device:** a new scenario in the existing harness (`qa/build-host.sh`,
    `qa/*.cpp`, real sockets, ASan/UBSan) that starts the sender, connects a fake subscriber,
-   sends a coded frame with the HEVC tag, and asserts the received header carries the tag and
-   the payload is byte-identical. Plus the harness's usual mutant: with `ext.codec` forced to
-   VMX1 the scenario must fail, or it proves nothing.
+   and sends two coded frames with the HEVC tag. It asserts the received header carries the tag,
+   the payload is byte-identical, the header geometry equals the per-frame geometry (with a size
+   change between the two frames), and the timestamp delta is the frame period in 100 ns ticks.
+   Mutants, one per assertion: `ext.codec` forced to VMX1, geometry taken from the sender's
+   init-time values, timestamps passed as microseconds. Each mutant must fail, or the scenario
+   proves nothing.
 2. **Android build:** needs the SDK + NDK 27 + cmake 3.22 (`AGENT-HANDOFF.md`), then
    `./gradlew assembleDebug`. Not possible on the current machine yet — no SDK/NDK installed.
 3. **On a phone, against a PC:** install, set Mode = HX, start streaming; on the PC
@@ -164,8 +220,13 @@ measurement.
 
 ## 7. Limits and risks
 
-- Device HEVC encoders vary. Fallback to H.264 is automatic, but 4K60 HEVC is not guaranteed on
-  older phones.
+- Device HEVC encoders vary, and so do camera high-speed sessions. The clamp in 4.3 turns an
+  unsupported request into a smaller or slower stream that is visible in the status text; the
+  H.264 fallback is automatic. 4K60 is common, 4K120 is not.
+- 4K120 at ~150 Mbps needs Wi-Fi 6 or wired; on ordinary 5 GHz Wi-Fi the link, not the encoder,
+  becomes the limit.
+- Encoder capabilities can shrink under thermal load. v1 does not re-clamp live; restart the
+  stream if the device throttles.
 - The phone announces on port 6400 with `NsdManager`, unchanged. If the PC cannot see the phone
   in HX mode but can in Full mode, the fault is in the codec tag, not discovery.
 - MediaCodec's surface encoder applies the camera's sensor orientation; the current YUV path has
@@ -182,4 +243,7 @@ measurement.
   target device, or CSD prepending is required.
 - Whether the coded validation lives in `validateFrame()` or in a separate `validateCoded()`.
 - Threading for `nativeSendCoded` (keep the existing mutex, or give coded sends their own).
+- Where the detach callback is carried (`Preview` method parameter vs `CameraController2`
+  listener) — the ordering requirement is fixed, the wiring is not.
+- The exact order of the capability clamp when both size and rate have to give.
 - Whether the Mode list should hide the Quality list in HX mode (cosmetic).
