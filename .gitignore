@@ -51,3 +51,5 @@ app/src/main/res/drawable/test_pattern_1080p.png
 # --- Personal / Development Files (Do not push) ---
 LOGBOOK.md
 libomt/LOGBOOK.md
+# superpowers agent state
+.superpowers/
