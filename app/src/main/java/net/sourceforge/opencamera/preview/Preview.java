@@ -5293,6 +5293,17 @@ public class Preview implements SurfaceHolder.Callback, TextureView.SurfaceTextu
         return new int[] { selected_min_fps, selected_max_fps };
     }
 
+    /** Whether any of the supplied fps ranges includes the given whole frame rate. */
+    public static boolean fpsSupportedByRanges(List<int[]> fps_ranges, int fps) {
+        if (fps_ranges == null)
+            return false;
+        for (int[] fps_range : fps_ranges) {
+            if (fps_range[0] <= fps * 1000 && fps * 1000 <= fps_range[1])
+                return true;
+        }
+        return false;
+    }
+
     public static int[] chooseBestPreviewFps(List<int[]> fps_ranges) {
         if (MyDebug.LOG)
             Log.d(TAG, "chooseBestPreviewFps()");
@@ -5431,8 +5442,14 @@ public class Preview implements SurfaceHolder.Callback, TextureView.SurfaceTextu
             // is needed for anything, so thinking about it, best to keep things as they
             // were before for Camera2
             if (using_android_l) {
-                if (MyDebug.LOG)
+                String fps_value = applicationInterface.getVideoFPSPref();
+                if (!fps_value.equals("default")) {
+                    // An explicit rate applies everywhere: it drives video recording and the OMT
+                    // stream, and the stream is fed by this preview session even in photo mode.
+                    selected_fps = matchPreviewFpsToVideo(fps_ranges, (int) (profile.videoCaptureRate * 1000));
+                } else if (MyDebug.LOG) {
                     Log.d(TAG, "don't set preview fps for camera2 and photo");
+                }
             } else {
                 selected_fps = chooseBestPreviewFps(fps_ranges);
             }

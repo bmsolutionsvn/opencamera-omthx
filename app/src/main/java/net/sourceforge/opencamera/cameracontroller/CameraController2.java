@@ -5766,6 +5766,17 @@ public class CameraController2 extends CameraController {
     }
 
     @Override
+    public List<int[]> getSupportedAeFpsRange() {
+        List<int[]> l = new ArrayList<>();
+        if (ae_fps_ranges != null) {
+            for (int[] r : ae_fps_ranges) {
+                l.add(new int[] { r[0] * 1000, r[1] * 1000 });
+            }
+        }
+        return l;
+    }
+
+    @Override
     public void setFocusValue(String focus_value) {
         if (MyDebug.LOG)
             Log.d(TAG, "setFocusValue: " + focus_value);

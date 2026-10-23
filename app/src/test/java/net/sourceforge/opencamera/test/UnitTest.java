@@ -216,6 +216,17 @@ public class UnitTest {
         assertTrue(best_fps2[0] == 7000 && best_fps2[1] == 10000);
     }
 
+    @Test
+    public void testFpsSupportedByRanges() {
+        List<int []> list0 = new ArrayList<>();
+        list0.add(new int[]{15000, 30000});
+        list0.add(new int[]{60000, 60000});
+        assertTrue(Preview.fpsSupportedByRanges(list0, 30));
+        assertTrue(Preview.fpsSupportedByRanges(list0, 60));
+        assertFalse(Preview.fpsSupportedByRanges(list0, 120));
+        assertFalse(Preview.fpsSupportedByRanges(null, 60));
+    }
+
     private void compareVideoQuality(List<String> video_quality, List<String> exp_video_quality) {
         for(int i=0;i<video_quality.size();i++) {
             Log.d(TAG, "supported video quality: " + video_quality.get(i));

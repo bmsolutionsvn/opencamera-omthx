@@ -801,6 +801,11 @@ public abstract class CameraController {
 
     public abstract List<int[]> getSupportedPreviewFpsRange(); // result depends on setting of setVideoHighSpeed()
 
+    /** The sensor's own fps ranges, independent of any high-speed mode. */
+    public List<int[]> getSupportedAeFpsRange() {
+        return getSupportedPreviewFpsRange();
+    }
+
     public abstract void setFocusValue(String focus_value);
 
     public abstract String getFocusValue();

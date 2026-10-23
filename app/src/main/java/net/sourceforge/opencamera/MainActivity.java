@@ -4111,11 +4111,18 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             int[] candidate_fps = { 15, 24, 25, 30, 60, 96, 100, 120, 240 };
             List<Integer> video_fps = new ArrayList<>();
             List<Boolean> video_fps_high_speed = new ArrayList<>();
+            // The video sizes describe what the HAL reports for MediaRecorder output; some devices
+            // cap that at 30 even though the sensor runs (and the stock camera records) at 60.
+            // The AE ranges are the sensor's own answer, so accept either.
+            List<int[]> ae_fps_ranges = this.preview.getCameraController() != null
+                    ? this.preview.getCameraController().getSupportedAeFpsRange()
+                    : null;
             for (int fps : candidate_fps) {
                 if (preview.fpsIsHighSpeed(String.valueOf(fps))) {
                     video_fps.add(fps);
                     video_fps_high_speed.add(true);
-                } else if (this.preview.getVideoQualityHander().videoSupportsFrameRate(fps)) {
+                } else if (this.preview.getVideoQualityHander().videoSupportsFrameRate(fps)
+                        || Preview.fpsSupportedByRanges(ae_fps_ranges, fps)) {
                     video_fps.add(fps);
                     video_fps_high_speed.add(false);
                 }
