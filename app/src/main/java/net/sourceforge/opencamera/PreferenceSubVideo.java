@@ -256,6 +256,7 @@ public class PreferenceSubVideo extends PreferenceSubScreen {
 
         setupOmtStreamingPreferences(sharedPreferences);
         setupDependencies();
+        removeRecordingOnlyPreferences();
 
         if (MyDebug.LOG)
             Log.d(TAG, "onCreate done");
@@ -313,6 +314,27 @@ public class PreferenceSubVideo extends PreferenceSubScreen {
                 } else {
                     pref.setEnabled(false);
                 }
+            }
+        }
+    }
+
+    /**
+     * This app is an OMT transmitter only, so settings that only ever affected recorded files are
+     * hidden. Removed after setup, which still configures them, so nothing reads a missing preference.
+     * Frame rate stays reachable as OMT "Stream Frame Rate" (the same setting) and in the popup.
+     */
+    private void removeRecordingOnlyPreferences() {
+        PreferenceGroup root = (PreferenceGroup) findPreference("preferences_root");
+        PreferenceGroup debugging = (PreferenceGroup) findPreference("preference_category_video_debugging");
+        for (String key : new String[] { "preference_video_output_format", "preference_video_max_duration",
+                "preference_video_restart", "preference_video_max_filesize",
+                "preference_video_restart_max_filesize", "preference_record_audio", "preference_record_audio_src",
+                "preference_record_audio_channels", "preference_lock_video", "preference_video_subtitle",
+                "preference_video_bitrate", "preference_video_fps", "preference_video_low_power_check",
+                "preference_video_flash" }) {
+            Preference pref = findPreference(key);
+            if (pref != null && !root.removePreference(pref) && debugging != null) {
+                debugging.removePreference(pref);
             }
         }
     }

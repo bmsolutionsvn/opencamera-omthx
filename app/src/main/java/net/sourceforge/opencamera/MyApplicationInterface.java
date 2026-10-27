@@ -506,7 +506,9 @@ public class MyApplicationInterface extends BasicApplicationInterface {
 
     @Override
     public boolean isVideoPref() {
-        return sharedPreferences.getBoolean(PreferenceKeys.IsVideoPreferenceKey, true);
+        // OMT transmitter only: always video mode, which is what gives video sizes, the fps list and
+        // the high speed (60 from 120) streaming path.
+        return true;
     }
 
     @Override

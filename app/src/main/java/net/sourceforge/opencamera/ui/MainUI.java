@@ -984,6 +984,7 @@ public class MainUI {
         if (MyDebug.LOG) {
             Log.d(TAG, "layoutUI: total time: " + (System.currentTimeMillis() - debug_time));
         }
+        hideNonStreamingButtons();
     }
 
     /**
@@ -1142,10 +1143,10 @@ public class MainUI {
             if (main_activity.getPreview().isVideo()) {
                 if (MyDebug.LOG)
                     Log.d(TAG, "set icon to video");
-                resource = main_activity.getPreview().isVideoRecording() ? R.drawable.take_video_recording
-                        : R.drawable.take_video_selector;
-                content_description = main_activity.getPreview().isVideoRecording() ? R.string.stop_video
-                        : R.string.start_video;
+                // OMT transmitter: the shutter is Go Live (red dot) / Stop (stop square)
+                boolean live = main_activity.isOmtStreaming();
+                resource = live ? R.drawable.take_video_recording : R.drawable.take_video_selector;
+                content_description = live ? R.string.omt_streaming_stop : R.string.omt_streaming_start;
                 switch_video_content_description = R.string.switch_to_photo;
             } else if (main_activity.getApplicationInterface()
                     .getPhotoMode() == MyApplicationInterface.PhotoMode.Panorama &&
@@ -1494,6 +1495,7 @@ public class MainUI {
                     // make sure the GUI is set up as expected
                     showGUI();
                 }
+                hideNonStreamingButtons();
             }
         });
     }
@@ -1617,6 +1619,7 @@ public class MainUI {
                 if (show_gui_photo && show_gui_video) {
                     layoutUI(); // needed for "top" UIPlacement, to auto-arrange the buttons
                 }
+                hideNonStreamingButtons();
             }
         });
     }
@@ -1756,13 +1759,26 @@ public class MainUI {
     /**
      * Update the OMT streaming button visibility based on preferences.
      */
-    public void updateOmtStreamingIcon() {
-        View button = main_activity.findViewById(R.id.omt_streaming);
-        if (button != null) {
-            SharedPreferences sharedPreferences = PreferenceManager.getDefaultSharedPreferences(main_activity);
-            boolean enabled = sharedPreferences.getBoolean(PreferenceKeys.OmtStreamingEnabledKey, true);
-            button.setVisibility(enabled ? View.VISIBLE : View.GONE);
+    /**
+     * This app is an OMT transmitter only: the photo/video capture controls stay in the layout (the
+     * rest of Open Camera still references them) but are never shown. The shutter is Go Live/Stop.
+     */
+    private void hideNonStreamingButtons() {
+        for (int id : new int[] { R.id.gallery, R.id.switch_video, R.id.pause_video,
+                R.id.take_photo_when_video_recording, R.id.cancel_panorama, R.id.trash, R.id.share,
+                R.id.cycle_raw, R.id.store_location, R.id.text_stamp, R.id.stamp, R.id.audio_control,
+                R.id.omt_streaming }) {
+            View view = main_activity.findViewById(id);
+            if (view != null) {
+                view.setVisibility(View.GONE);
+            }
         }
+    }
+
+    public void updateOmtStreamingIcon() {
+        // the shutter is Go Live/Stop now, so the separate OMT button stays hidden with the other
+        // capture-only controls; this runs last in the icon pass, after anything that re-showed them
+        hideNonStreamingButtons();
         main_activity.refreshOmtStatus();
     }
 

@@ -67,6 +67,9 @@ public class PopupView extends LinearLayout {
     private int picture_size_index = -1;
     private int nr_mode_index = -1;
     private int burst_n_images_index = -1;
+    // OMT transmitter only: auto-level, slow motion/timelapse speed, timer and repeat only ever
+    // affected saved photos and videos, so they are left out of the popup.
+    private static final boolean CAPTURE_CONTROLS = false;
     private int video_size_index = -1;
     private int video_fps_index = -1;
     private int video_capture_rate_index = -1;
@@ -343,7 +346,7 @@ public class PopupView extends LinearLayout {
                 });
             }
 
-            if( main_activity.supportsAutoStabilise() && !main_activity.getMainUI().showAutoLevelIcon() ) {
+            if( CAPTURE_CONTROLS && main_activity.supportsAutoStabilise() && !main_activity.getMainUI().showAutoLevelIcon() ) {
                 // don't show auto-stabilise checkbox on popup if there's an on-screen icon
                 CheckBox checkBox = new CheckBox(main_activity);
                 checkBox.setText(getResources().getString(R.string.preference_auto_stabilise));
@@ -820,7 +823,7 @@ public class PopupView extends LinearLayout {
                 }
             }
 
-            if( preview.isVideo() ) {
+            if( CAPTURE_CONTROLS && preview.isVideo() ) {
                 final List<Float> capture_rate_values = main_activity.getApplicationInterface().getSupportedVideoCaptureRates();
                 if( capture_rate_values.size() > 1 ) {
                     if( MyDebug.LOG )
@@ -930,7 +933,7 @@ public class PopupView extends LinearLayout {
                 }
             }
 
-            if( photo_mode != MyApplicationInterface.PhotoMode.Panorama ) {
+            if( CAPTURE_CONTROLS && photo_mode != MyApplicationInterface.PhotoMode.Panorama ) {
                 // timer not supported with panorama
 
                 final String [] timer_values = getResources().getStringArray(R.array.preference_timer_values);
@@ -976,7 +979,7 @@ public class PopupView extends LinearLayout {
             if( MyDebug.LOG )
                 Log.d(TAG, "PopupView time 11: " + (System.nanoTime() - debug_time));
 
-            if( photo_mode != MyApplicationInterface.PhotoMode.Panorama ) {
+            if( CAPTURE_CONTROLS && photo_mode != MyApplicationInterface.PhotoMode.Panorama ) {
                 // auto-repeat not supported with panorama
 
                 final String [] repeat_mode_values = getResources().getStringArray(R.array.preference_burst_mode_values);

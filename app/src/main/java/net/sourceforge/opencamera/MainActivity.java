@@ -2246,41 +2246,7 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
      *         click should still be triggered when the user releases the touch.
      */
     private boolean longClickedTakePhoto() {
-        if (MyDebug.LOG)
-            Log.d(TAG, "longClickedTakePhoto");
-        if (preview.isVideo()) {
-            // no long-click action for video mode
-        } else if (supportsFastBurst()) {
-            // need to check whether fast burst is supported (including for the current
-            // resolution),
-            // in case we're in Standard photo mode
-            CameraController.Size current_size = preview.getCurrentPictureSize();
-            if (current_size != null && current_size.supports_burst) {
-                MyApplicationInterface.PhotoMode photo_mode = applicationInterface.getPhotoMode();
-                if (photo_mode == MyApplicationInterface.PhotoMode.Standard &&
-                        applicationInterface.isRawOnly(photo_mode)) {
-                    if (MyDebug.LOG)
-                        Log.d(TAG, "fast burst not supported in RAW-only mode");
-                    // in JPEG+RAW mode, a continuous fast burst will only produce JPEGs which is
-                    // fine; but in RAW only mode,
-                    // no images at all would be saved! (Or we could switch to produce JPEGs anyway,
-                    // but this seems misleading
-                    // in RAW only mode.)
-                } else if (photo_mode == MyApplicationInterface.PhotoMode.Standard ||
-                        photo_mode == MyApplicationInterface.PhotoMode.FastBurst) {
-                    this.takePicturePressed(false, true);
-                    return true;
-                }
-            } else {
-                if (MyDebug.LOG)
-                    Log.d(TAG, "fast burst not supported for this resolution");
-            }
-        } else {
-            if (MyDebug.LOG)
-                Log.d(TAG, "fast burst not supported");
-        }
-        // return false, so a regular click will still be triggered when the user
-        // releases the touch
+        // OMT-only app: no fast burst; a long press is a normal press (Go Live/Stop)
         return false;
     }
 
@@ -2703,6 +2669,9 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
      * Update OMT streaming button appearance.
      */
     private void updateOmtStreamingUI(boolean isStreaming) {
+        if (mainUI != null) {
+            mainUI.setTakePhotoIcon(); // the shutter shows Go Live / Stop
+        }
         ImageButton button = findViewById(R.id.omt_streaming);
         if (button != null) {
             if (isStreaming) {
@@ -6862,30 +6831,7 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
     public void takePicture(boolean photo_snapshot) {
         if (MyDebug.LOG)
             Log.d(TAG, "takePicture");
-
-        if (applicationInterface.getPhotoMode() == MyApplicationInterface.PhotoMode.Panorama) {
-            if (preview.isTakingPhoto()) {
-                if (MyDebug.LOG)
-                    Log.d(TAG, "ignore whilst taking panorama photo");
-            } else if (applicationInterface.getGyroSensor().isRecording()) {
-                if (MyDebug.LOG)
-                    Log.d(TAG, "panorama complete");
-                applicationInterface.finishPanorama();
-                return;
-            } else if (!applicationInterface.canTakeNewPhoto()) {
-                if (MyDebug.LOG)
-                    Log.d(TAG, "can't start new panoroma, still saving in background");
-                // we need to test here, otherwise the Preview won't take a new photo - but
-                // we'll think we've
-                // started the panorama!
-            } else {
-                if (MyDebug.LOG)
-                    Log.d(TAG, "start panorama");
-                applicationInterface.startPanorama();
-            }
-        }
-
-        this.takePicturePressed(photo_snapshot, false);
+        takePicturePressed(photo_snapshot, false); // OMT-only app: the shutter is Go Live/Stop
     }
 
     /**
@@ -6909,8 +6855,9 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
 
         closePopup();
 
-        this.last_continuous_fast_burst = continuous_fast_burst;
-        this.preview.takePicturePressed(photo_snapshot, continuous_fast_burst);
+        // This app is an OMT transmitter: every shutter path (button, volume keys, remote control,
+        // audio trigger) lands here and starts or stops the stream. Nothing is captured to storage.
+        clickedOmtStreaming(null);
     }
 
     /**

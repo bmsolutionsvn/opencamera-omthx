@@ -7,6 +7,9 @@ android {
     // than you target.
     compileSdk 36
     compileOptions.encoding = 'UTF-8'
+    // MyDebug.LOG is on in debug code, so local unit tests hit android.util.Log; the stub jar throws
+    // on every call unless it is told to return defaults.
+    testOptions.unitTests.returnDefaultValues = true
 
     defaultConfig {
         applicationId "io.github.ysdede.opencameraomt"

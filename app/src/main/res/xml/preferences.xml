@@ -75,34 +75,9 @@
             android:summary="@string/preference_face_detection_summary"
             android:defaultValue="false"
             />
-
-        <ListPreference
-            android:key="preference_timer"
-            android:title="@string/preference_timer"
-            android:summary="%s"
-            android:icon="@drawable/ic_timer_white_48dp"
-            android:entries="@array/preference_timer_entries"
-            android:entryValues="@array/preference_timer_values"
-            android:defaultValue="0"
-            />
-
-        <ListPreference 
-            android:key="preference_burst_mode"
-            android:title="@string/preference_burst_mode"
-            android:summary="%s"
-            android:entries="@array/preference_burst_mode_entries"
-            android:entryValues="@array/preference_burst_mode_values"
-            android:defaultValue="1"
-            />
-
-        <ListPreference
-            android:key="preference_burst_interval"
-            android:title="@string/preference_burst_interval"
-            android:summary="%s"
-            android:entries="@array/preference_burst_interval_entries"
-            android:entryValues="@array/preference_burst_interval_values"
-            android:defaultValue="0"
-            />
+
+
+
 
         <PreferenceScreen
             android:key="preference_screen_camera_controls_more"
@@ -133,14 +108,7 @@
     <PreferenceCategory
         android:key="preference_category_camera_quality"
         android:title="@string/preference_category_camera_quality">
-
-        <PreferenceScreen
-            android:key="preference_screen_photo_settings"
-            android:title="@string/preference_screen_photo_settings"
-            android:icon="@drawable/take_photo_pref"
-            android:persistent="false"
-            android:fragment="net.sourceforge.opencamera.PreferenceSubPhoto"
-            />
+
     
         <PreferenceScreen
             android:key="preference_screen_video_settings"
@@ -149,14 +117,7 @@
             android:persistent="false"
             android:fragment="net.sourceforge.opencamera.PreferenceSubVideo"
             />
-
-        <PreferenceScreen
-            android:key="preference_screen_location_settings"
-            android:title="@string/preference_screen_location_settings"
-            android:icon="@drawable/ic_gps_fixed_white_48dp"
-            android:persistent="false"
-            android:fragment="net.sourceforge.opencamera.PreferenceSubLocation"
-            />
+
 
         <PreferenceScreen
             android:key="preference_screen_processing_settings"
