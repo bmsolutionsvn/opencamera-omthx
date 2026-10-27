@@ -168,6 +168,9 @@ int omt_send(omt_send_t* instance, OMTMediaFrame* frame) {
 int omt_send_connections(omt_send_t* instance) {
     return instance ? reinterpret_cast<Sender*>(instance)->connectionCount() : 0;
 }
+int omt_send_viewers(omt_send_t* instance) {
+    return instance ? reinterpret_cast<Sender*>(instance)->viewerCount() : 0;
+}
 int omt_send_getaddress(omt_send_t*, char*, int) { return 0; }
 int64_t omt_send_get_frames_sent(omt_send_t* i) { return i ? reinterpret_cast<Sender*>(i)->getStats().totalFramesSent : 0; }
 int64_t omt_send_get_frames_dropped(omt_send_t* i) { return i ? reinterpret_cast<Sender*>(i)->getStats().totalFramesDropped : 0; }

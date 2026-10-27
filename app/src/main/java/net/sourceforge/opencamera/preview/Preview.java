@@ -3579,7 +3579,8 @@ public class Preview implements SurfaceHolder.Callback, TextureView.SurfaceTextu
                     // we'll end up trying to record at the requested resolution and fps even though
                     // these seem incompatible;
                     // the camera driver will either ignore the requested fps, or fail
-                } else if (best_video_size.high_speed) {
+                } else if (best_video_size.high_speed && fpsIsHighSpeed(String.valueOf(capture_rate))) {
+                    // (a rate the sensor runs in a normal session stays normal - see fpsIsHighSpeed())
                     video_high_speed = true;
                 }
             }
@@ -3761,7 +3762,9 @@ public class Preview implements SurfaceHolder.Callback, TextureView.SurfaceTextu
         // first set picture size (for photo mode, must be done now so we can set the
         // picture size from this; for video, doesn't really matter when we set it)
         CameraController.Size new_size;
-        if (this.is_video) {
+        // While OMT streams, a full-resolution still stream in the session pushes most HALs into a
+        // full-sensor mode that tops out at 30 fps, so cap stills at the video size, as video mode does.
+        if (this.is_video || omt_streaming_surface != null) {
             // see comments for getOptimalVideoPictureSize()
             VideoProfile profile = getVideoProfile();
             if (MyDebug.LOG)
@@ -8657,7 +8660,10 @@ public class Preview implements SurfaceHolder.Callback, TextureView.SurfaceTextu
                     Log.d(TAG, "fps: " + fps);
                 // need to check both, e.g., 30fps on Nokia 8 is in fps ranges of both normal
                 // and high speed video sizes
-                if (video_quality_handler.videoSupportsFrameRate(fps)) {
+                // A rate the sensor offers as a normal AE range is normal, even when the HAL also lists
+                // it as high speed: treating 60 as high speed keeps it off the OMT stream.
+                if (video_quality_handler.videoSupportsFrameRate(fps) || (camera_controller != null
+                        && fpsSupportedByRanges(camera_controller.getSupportedAeFpsRange(), fps))) {
                     if (MyDebug.LOG)
                         Log.d(TAG, "fps is normal");
                     return false;

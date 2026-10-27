@@ -873,6 +873,17 @@ Java_net_sourceforge_opencamera_OMTSender_nativeGetConnectionCount(
 }
 
 /**
+ * Get the number of receivers watching video (one per receiver; the connection count is two).
+ */
+JNIEXPORT jint JNICALL
+Java_net_sourceforge_opencamera_OMTSender_nativeGetViewerCount(
+        JNIEnv* env,
+        jobject /* this */) {
+    std::lock_guard<std::mutex> lock(g_senderMutex);
+    return g_sender == nullptr ? 0 : omt_send_viewers(g_sender);
+}
+
+/**
  * Get the discovery address string for this sender.
  */
 JNIEXPORT jstring JNICALL

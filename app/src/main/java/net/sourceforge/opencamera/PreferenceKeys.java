@@ -419,4 +419,6 @@ public class PreferenceKeys {
     // Full = the existing VMX stream; hx = OMT HX (HEVC/H.264 access units from MediaCodec).
     public static final String OmtStreamingModeKey = "preference_omt_streaming_mode";
     public static final String OmtHxCodecKey = "preference_omt_streaming_hx_codec";
+    // HX stream rate when the camera runs a high speed rate ("60" with 120 HS); "0" = the camera rate.
+    public static final String OmtHxFpsCapKey = "preference_omt_streaming_hx_fps_cap";
 }

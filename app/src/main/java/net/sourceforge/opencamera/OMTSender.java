@@ -329,6 +329,11 @@ public class OMTSender {
         return isInitialized ? nativeGetConnectionCount() : 0;
     }
 
+    /** Receivers watching video: one per receiver (each also holds an audio connection). */
+    public int getViewerCount() {
+        return isInitialized ? nativeGetViewerCount() : 0;
+    }
+
     /**
      * Get the discovery address for this sender.
      * Format: "HOSTNAME (Name)"
@@ -468,6 +473,8 @@ public class OMTSender {
     private native long nativeGetRingRefused();
 
     private native int nativeGetConnectionCount();
+
+    private native int nativeGetViewerCount();
 
     private native String nativeGetAddress();
 

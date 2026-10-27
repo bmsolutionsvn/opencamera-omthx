@@ -1763,6 +1763,7 @@ public class MainUI {
             boolean enabled = sharedPreferences.getBoolean(PreferenceKeys.OmtStreamingEnabledKey, true);
             button.setVisibility(enabled ? View.VISIBLE : View.GONE);
         }
+        main_activity.refreshOmtStatus();
     }
 
     public void audioControlStarted() {

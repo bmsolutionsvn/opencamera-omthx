@@ -514,6 +514,11 @@ extern "C" {
     int omt_send_connections(omt_send_t* instance);
 
     /**
+    * Number of receivers subscribed to video: one per receiver, unlike omt_send_connections.
+    */
+    int omt_send_viewers(omt_send_t* instance);
+
+    /**
     * Receive any available metadata in the buffer, or wait for metadata if empty
     * 
     * Returns a valid OMTMediaFrame if found, null of timed out

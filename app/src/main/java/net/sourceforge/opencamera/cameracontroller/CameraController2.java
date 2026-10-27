@@ -6741,7 +6741,7 @@ public class CameraController2 extends CameraController {
                             }
                             previewBuilder.addTarget(video_recorder_surface);
                         }
-                        if (omt_streaming_surface != null && !want_video_high_speed) {
+                        if (omt_streaming_surface != null && (!want_video_high_speed || video_recorder == null)) {
                             if (MyDebug.LOG) {
                                 Log.d(TAG, "add omt streaming surface to previewBuilder: " + omt_streaming_surface);
                             }
@@ -6861,10 +6861,8 @@ public class CameraController2 extends CameraController {
                     }
                     // n.b., raw not supported for photo snapshots while video recording
                 } else if (want_video_high_speed) {
-                    // future proofing - at the time of writing want_video_high_speed is only set
-                    // when recording video,
-                    // but if ever this is changed, can only support the preview_surface as a target
-                    // also OMT not supported in high speed
+                    // a high speed session takes the preview plus one video surface: when not
+                    // recording, that slot goes to the OMT HX encoder (added below)
                 } else if (imageReaderRaw != null) {
                     surfaces_list.add(imageReader.getSurface());
                     surfaces_list.add(imageReaderRaw.getSurface());
@@ -6872,8 +6870,9 @@ public class CameraController2 extends CameraController {
                     surfaces_list.add(imageReader.getSurface());
                 }
 
-                // Add OMT streaming surface if available (and not high speed)
-                if (omt_streaming_surface != null && !want_video_high_speed) {
+                // Add OMT streaming surface if available (in high speed, only when not recording:
+                // the session has room for one video surface)
+                if (omt_streaming_surface != null && (!want_video_high_speed || video_recorder == null)) {
                     if (MyDebug.LOG)
                         Log.d(TAG, "adding omt_streaming_surface: " + omt_streaming_surface);
                     surfaces_list.add(omt_streaming_surface);
@@ -6958,8 +6957,11 @@ public class CameraController2 extends CameraController {
                     }, on_failed);
                 }
                 is_video_high_speed = false;
-            } else if (video_recorder != null && want_video_high_speed
+            } else if ((video_recorder != null || omt_streaming_surface != null) && want_video_high_speed
                     && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                // Streaming OMT HX from a high speed session is how phones that keep 60 fps out of
+                // normal sessions (e.g. Xiaomi 14T Pro: 30, 120 HS, 240 HS) still stream at 60: the
+                // camera runs at 120 and the encoder keeps every other frame.
                 // if( want_video_high_speed && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M )
                 // {
                 if (MyDebug.LOG)
@@ -7001,7 +7003,9 @@ public class CameraController2 extends CameraController {
                 if (MyDebug.LOG)
                     Log.d(TAG, "create capture session");
                 try {
-                    if ((cameraIdSPhysical != null || want_jpeg_r) && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    final Range<Integer> session_fps_range = camera_settings.ae_target_fps_range;
+                    if ((cameraIdSPhysical != null || want_jpeg_r || session_fps_range != null)
+                            && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                         List<OutputConfiguration> outputs = createOutputConfigurationList(surfaces, preview_surface);
                         /*
                          * camera.createCaptureSessionByOutputConfigurations(outputs,
@@ -7010,6 +7014,15 @@ public class CameraController2 extends CameraController {
                          */
                         SessionConfiguration sessionConfiguration = new SessionConfiguration(
                                 SessionConfiguration.SESSION_REGULAR, outputs, executor, myStateCallback);
+                        if (session_fps_range != null) {
+                            // Most HALs choose the sensor mode when the session is configured. A fps
+                            // range that only appears on the repeating request arrives too late, and
+                            // the sensor stays in its 30 fps mode.
+                            CaptureRequest.Builder session_params = camera
+                                    .createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                            session_params.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, session_fps_range);
+                            sessionConfiguration.setSessionParameters(session_params.build());
+                        }
                         launchCameraSession(wait_until_started, new CreateCaptureSessionFunction() {
                             @Override
                             public void call() throws CameraAccessException {

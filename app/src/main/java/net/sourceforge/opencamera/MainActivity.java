@@ -2522,16 +2522,24 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         // HX: keep the profile's size when the encoder can do it, otherwise the largest size/rate the
         // device really supports (up to 4K120). Full mode keeps the profile untouched.
         String hxMime = null;
+        if (preview.isVideoHighSpeed() && !"hx".equals(omtMode)) {
+            // A high speed session only takes preview and encoder surfaces, never the ImageReader
+            // Full mode needs, so the stream would start and then carry no frames.
+            preview.showToast(null, "High speed frame rates need OMT HX mode (Settings > OMT)", true);
+            return;
+        }
         if ("hx".equals(omtMode)) {
-            // CameraController2 leaves the OMT surface out of every high-speed capture session
-            // (`want_video_high_speed`), so an HX request at 120/240 fps would start "successfully"
-            // and then produce nothing at all. Say so instead of showing a red button over a black
-            // receiver.
             if (preview.isVideoHighSpeed()) {
-                preview.showToast(null,
-                        "OMT HX cannot use a high-speed video profile - choose 60 fps or lower in Video settings",
-                        true);
-                return;
+                // The camera runs at the high speed rate; the encoder keeps the stream rate, e.g. 60
+                // from 120 for phones whose normal sessions stop at 30.
+                int cap = 0;
+                try {
+                    cap = Integer.parseInt(omtPrefs.getString(PreferenceKeys.OmtHxFpsCapKey, "0"));
+                } catch (NumberFormatException ignored) {
+                }
+                if (cap > 0 && cap < fps) {
+                    fps = cap;
+                }
             }
             hxMime = pickOmtHxMime("hevc".equals(omtHxCodec));
             if (hxMime == null) {
@@ -2580,6 +2588,28 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         } else if (omtStreamingManager != null) {
             preview.setOmtStreamingSurface(omtStreamingManager.getStreamingSurface());
         }
+    }
+
+    /** The frame rates the current camera can record or stream (Camera2 only; empty otherwise). */
+    public List<Integer> getSupportedVideoFps() {
+        List<Integer> video_fps = new ArrayList<>();
+        if (!preview.usingCamera2API()) {
+            return video_fps;
+        }
+        // The video sizes describe what the HAL reports for MediaRecorder output; some devices
+        // cap that at 30 even though the sensor runs (and the stock camera records) at 60.
+        // The AE ranges are the sensor's own answer, so accept either.
+        List<int[]> ae_fps_ranges = preview.getCameraController() != null
+                ? preview.getCameraController().getSupportedAeFpsRange()
+                : null;
+        for (int fps : new int[] { 15, 24, 25, 30, 50, 60, 96, 100, 120, 240 }) {
+            if (preview.fpsIsHighSpeed(String.valueOf(fps))
+                    || preview.getVideoQualityHander().videoSupportsFrameRate(fps)
+                    || Preview.fpsSupportedByRanges(ae_fps_ranges, fps)) {
+                video_fps.add(fps);
+            }
+        }
+        return video_fps;
     }
 
     /** The HX encoder MIME for the requested codec, falling back to the other one this device has. */
@@ -2691,37 +2721,105 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
             if (isStreaming && preview != null) {
                 try {
                     textView.setVisibility(View.VISIBLE);
+                    // Refresh once a second while live, so the measured rate below stays current.
+                    textView.removeCallbacks(omtStatusTicker);
+                    textView.postDelayed(omtStatusTicker, 1000);
+                    if (android.os.SystemClock.uptimeMillis() < omtStatusHoldUntil) {
+                        return; // a warning from updateOmtStatusText() is still showing
+                    }
                     String codecLabel = omtStreamingManager != null
                             ? omtStreamingManager.getStreamingCodecLabel() : "VMX";
+                    // The measured rate is what the camera really delivers; the requested one is
+                    // only what was asked for. Showing both is how a 30 fps sensor mode shows up.
+                    int viewers = omtStreamingManager.getViewerCount();
+                    String format;
+                    int fps;
                     if (!"VMX".equals(codecLabel)) {
                         // HX: what the encoder is really producing, after the capability clamp.
                         int[] geometry = omtStreamingManager.getStreamingGeometry();
-                        textView.setText("HX " + codecLabel + " | " + geometry[0] + "x" + geometry[1]
-                                + " | " + geometry[2] + "fps");
-                        return;
+                        fps = geometry[2];
+                        format = "HX " + codecLabel + " " + geometry[0] + "x" + geometry[1];
+                    } else {
+                        net.sourceforge.opencamera.preview.VideoProfile profile = preview.getVideoProfile();
+                        int width = profile.videoFrameWidth;
+                        int height = profile.videoFrameHeight;
+                        fps = profile.videoCaptureRate > 0 ? (int) profile.videoCaptureRate : 30;
+                        int profileId = omtStreamingManager.getProfile();
+                        format = "VMX " + getOmtProfileDisplayName(profileId) + " " + width + "x" + height
+                                + " ~" + getOmtEstimatedBandwidth(width, height, fps, profileId);
                     }
-                    net.sourceforge.opencamera.preview.VideoProfile profile = preview.getVideoProfile();
-                    int width = profile.videoFrameWidth;
-                    int height = profile.videoFrameHeight;
-                    int fps = profile.videoCaptureRate > 0 ? (int) profile.videoCaptureRate : 30;
-
-                    // Get real-time profile from sender
-                    int profileId = omtStreamingManager.getProfile();
-                    String qualityLabel = getOmtProfileDisplayName(profileId);
-                    String bandwidth = getOmtEstimatedBandwidth(width, height, fps, profileId);
-
-                    String text = "VMX: " + qualityLabel + " | " + width + "x" + height + " | " + fps + "fps | ~"
-                            + bandwidth;
-                    textView.setText(text);
+                    float measured = omtStreamingManager.getMeasuredFps();
+                    android.text.SpannableStringBuilder sb = new android.text.SpannableStringBuilder();
+                    appendColored(sb, "● LIVE  ", 0xFFFF3B30);
+                    // amber once the camera delivers clearly less than asked (e.g. a 30 fps sensor mode)
+                    appendColored(sb, String.format(java.util.Locale.US, "%.1f/%d fps", measured, fps),
+                            measured < fps * 0.9f ? 0xFFFFC107 : Color.WHITE);
+                    sb.append("  ·  ").append(String.valueOf(viewers))
+                            .append(viewers == 1 ? " viewer\n" : " viewers\n").append(format);
+                    textView.setText(sb);
                 } catch (Exception e) {
                     Log.e(TAG, "Failed to get video profile for OMT stats", e);
                     textView.setText("OMT Streaming: Active");
                 }
             } else {
-                textView.setVisibility(View.GONE);
+                textView.removeCallbacks(omtStatusTicker);
+                String ready = (preview != null && preview.getCameraController() != null
+                        && applicationInterface.getOmtStreamingEnabled()) ? omtReadyText() : null;
+                textView.setVisibility(ready != null ? View.VISIBLE : View.GONE);
+                if (ready != null) {
+                    android.text.SpannableStringBuilder sb = new android.text.SpannableStringBuilder();
+                    appendColored(sb, "○ READY  ", 0xFFB0B0B0);
+                    sb.append(ready);
+                    textView.setText(sb);
+                }
             }
         }
     }
+
+    private static void appendColored(android.text.SpannableStringBuilder sb, String text, int color) {
+        int start = sb.length();
+        sb.append(text);
+        sb.setSpan(new android.text.style.ForegroundColorSpan(color), start, sb.length(),
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+    }
+
+    /** What the stream will carry if started now: "HX HEVC  1920x1080  60 fps (120 HS)". */
+    private String omtReadyText() {
+        SharedPreferences prefs = PreferenceManager.getDefaultSharedPreferences(this);
+        boolean hx = "hx".equals(prefs.getString(PreferenceKeys.OmtStreamingModeKey, "full"));
+        net.sourceforge.opencamera.preview.VideoProfile profile = preview.getVideoProfile();
+        int fps = profile.videoCaptureRate > 0 ? (int) profile.videoCaptureRate : 30;
+        String rate = fps + " fps";
+        if (preview.isVideoHighSpeed()) {
+            int cap = 0;
+            try {
+                cap = Integer.parseInt(prefs.getString(PreferenceKeys.OmtHxFpsCapKey, "0"));
+            } catch (NumberFormatException ignored) {
+            }
+            rate = (hx && cap > 0 && cap < fps) ? cap + " fps (" + fps + " HS)"
+                    : fps + " fps HS" + (hx ? "" : " - needs HX");
+        }
+        String format = hx ? "HX " + ("h264".equals(prefs.getString(PreferenceKeys.OmtHxCodecKey, "hevc"))
+                ? "H.264" : "HEVC") : "VMX";
+        return format + "  " + profile.videoFrameWidth + "x" + profile.videoFrameHeight + "  " + rate;
+    }
+
+    /** Re-reads the OMT label after settings or camera changes (MainUI icon refresh). */
+    public void refreshOmtStatus() {
+        updateOmtStreamingUI(isOmtStreaming());
+    }
+
+    /** The OMT label opens the quick settings popup, where FPS and resolution are. */
+    public void clickedOmtStatus(View view) {
+        clickedPopupSettings(view);
+    }
+
+    private long omtStatusHoldUntil; // uptime until which a status warning stays on screen
+    private final Runnable omtStatusTicker = () -> {
+        if (omtStreamingManager != null && omtStreamingManager.isStreaming()) {
+            updateOmtStreamingUI(true);
+        }
+    };
 
     /**
      * Map internal VMX profile ID to user-friendly quality label.
@@ -2797,12 +2895,8 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         if (textView != null && message != null) {
             textView.setVisibility(View.VISIBLE);
             textView.setText(message);
-            // Auto-hide warning after 3 seconds by restoring normal status
-            textView.postDelayed(() -> {
-                if (omtStreamingManager != null && omtStreamingManager.isStreaming()) {
-                    updateOmtStreamingUI(true); // Restore normal status text
-                }
-            }, 3000);
+            // keep the warning up for 3 seconds; the once-a-second status refresh then takes over
+            omtStatusHoldUntil = android.os.SystemClock.uptimeMillis() + 3000;
         }
     }
 
@@ -4108,24 +4202,10 @@ public class MainActivity extends AppCompatActivity implements PreferenceFragmen
         // set up supported fps values
         if (preview.usingCamera2API()) {
             // with Camera2, we know what frame rates are supported
-            int[] candidate_fps = { 15, 24, 25, 30, 60, 96, 100, 120, 240 };
-            List<Integer> video_fps = new ArrayList<>();
+            List<Integer> video_fps = getSupportedVideoFps();
             List<Boolean> video_fps_high_speed = new ArrayList<>();
-            // The video sizes describe what the HAL reports for MediaRecorder output; some devices
-            // cap that at 30 even though the sensor runs (and the stock camera records) at 60.
-            // The AE ranges are the sensor's own answer, so accept either.
-            List<int[]> ae_fps_ranges = this.preview.getCameraController() != null
-                    ? this.preview.getCameraController().getSupportedAeFpsRange()
-                    : null;
-            for (int fps : candidate_fps) {
-                if (preview.fpsIsHighSpeed(String.valueOf(fps))) {
-                    video_fps.add(fps);
-                    video_fps_high_speed.add(true);
-                } else if (this.preview.getVideoQualityHander().videoSupportsFrameRate(fps)
-                        || Preview.fpsSupportedByRanges(ae_fps_ranges, fps)) {
-                    video_fps.add(fps);
-                    video_fps_high_speed.add(false);
-                }
+            for (int fps : video_fps) {
+                video_fps_high_speed.add(preview.fpsIsHighSpeed(String.valueOf(fps)));
             }
             int[] video_fps_array = new int[video_fps.size()];
             for (int i = 0; i < video_fps.size(); i++) {

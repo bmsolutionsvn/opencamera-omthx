@@ -184,6 +184,12 @@ public:
      * Get current connection count
      */
     int connectionCount() const;
+
+    /**
+     * Receivers watching video. Each receiver opens two connections (video/metadata and audio),
+     * so connectionCount() is twice what a user thinks of as "viewers".
+     */
+    int viewerCount() const;
     
     /**
      * Get aggregated statistics

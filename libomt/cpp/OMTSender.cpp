@@ -249,6 +249,15 @@ int Sender::connectionCount() const {
     return static_cast<int>(channels_.size());
 }
 
+int Sender::viewerCount() const {
+    std::lock_guard<std::mutex> lock(channelsMutex_);
+    int n = 0;
+    for (const auto& ch : channels_) {
+        if (ch->isConnected() && ch->isVideoSubscribed()) ++n;
+    }
+    return n;
+}
+
 SenderStats Sender::getStats() {
     cleanupDisconnected();
     

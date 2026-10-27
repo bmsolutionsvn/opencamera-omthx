@@ -250,6 +250,7 @@ public class OMTStreamingManager {
                 final int codecTag = hevc ? OMTSender.CODEC_HEVC : OMTSender.CODEC_H264;
                 hxEncoder = new OMTHXEncoder(mime, codecTag, width, height, fps, bitrate);
                 hxEncoder.start((data, offset, length, tag, w, h, fpsN, fpsD, ptsNs, keyframe) -> {
+                    streamFrames++;
                     final OMTSender sender = omtSender;
                     if (sender != null) {
                         sender.sendCoded(data, offset, length, tag, w, h, fpsN, fpsD, ptsNs);
@@ -274,6 +275,8 @@ public class OMTStreamingManager {
             streamingWidth = width;
             streamingHeight = height;
             streamingFps = fps;
+            rateTimeNs = 0;
+            measuredFps = 0;
             streamingCodecLabel = ("hx".equals(mode) && mime != null)
                     ? (MediaFormat.MIMETYPE_VIDEO_HEVC.equals(mime) ? "HEVC" : "H.264")
                     : "VMX";
@@ -294,6 +297,27 @@ public class OMTStreamingManager {
             }
             return false;
         }
+    }
+
+    // Frames that reached the sender path (camera frames in Full, encoded frames in HX). Written by one
+    // thread at a time (the reader or the encoder drain); read on the UI thread.
+    private volatile long streamFrames;
+    private long rateFrames;
+    private long rateTimeNs;
+    private float measuredFps;
+
+    /** The frame rate the stream is really getting, averaged over the last ~second. UI thread only. */
+    public float getMeasuredFps() {
+        final long now = System.nanoTime();
+        final long frames = streamFrames;
+        if (rateTimeNs == 0 || now - rateTimeNs >= 900_000_000L) {
+            if (rateTimeNs != 0) {
+                measuredFps = (frames - rateFrames) * 1e9f / (now - rateTimeNs);
+            }
+            rateFrames = frames;
+            rateTimeNs = now;
+        }
+        return measuredFps;
     }
 
     /** The geometry actually in use: {width, height, fps} after any encoder clamp. */
@@ -367,6 +391,11 @@ public class OMTStreamingManager {
         return omtSender != null ? omtSender.getConnectionCount() : 0;
     }
 
+    /** Receivers watching video (getConnectionCount() counts each receiver twice). */
+    public int getViewerCount() {
+        return omtSender != null ? omtSender.getViewerCount() : 0;
+    }
+
     /**
      * Get the OMT address for discovery.
      */
@@ -431,6 +460,7 @@ public class OMTStreamingManager {
                 if (DEBUG_LOGS) Log.d(TAG, "acquireLatestImage returned null");
                 return;
             }
+            streamFrames++;
 
             try {
                 sendFrame(image);
@@ -624,7 +654,7 @@ public class OMTStreamingManager {
                 omtSender.pollStatsForReaping();
 
                 // Check connection count
-                int count = omtSender.getConnectionCount();
+                int count = omtSender.getViewerCount();
                 if (count != lastCount) {
                     lastCount = count;
                     if (callback != null) {

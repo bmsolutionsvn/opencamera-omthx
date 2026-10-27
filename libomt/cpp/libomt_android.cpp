@@ -186,6 +186,11 @@ int omt_send_connections(omt_send_t* instance) {
     return sender->connectionCount();
 }
 
+int omt_send_viewers(omt_send_t* instance) {
+    if (!instance) return 0;
+    return reinterpret_cast<omt::Sender*>(instance)->viewerCount();
+}
+
 // Custom helper for Android Bridge
 void omt_send_set_info_str(omt_send_t* instance, const char* product, const char* manufacturer) {
     if (instance && product && manufacturer) {

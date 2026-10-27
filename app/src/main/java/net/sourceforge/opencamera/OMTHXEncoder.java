@@ -70,6 +70,10 @@ public class OMTHXEncoder {
         // that carries the parameter sets. One second is the ceiling on that black frame.
         format.setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1);
         format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps);
+        // The camera can feed this surface faster than the stream rate (a 120 fps high speed session
+        // for a 60 fps stream); the input surface drops the surplus frames before they are encoded.
+        // ("max-fps-to-encoder" is MediaFormat.KEY_MAX_FPS_TO_ENCODER, public from API 29.)
+        format.setFloat("max-fps-to-encoder", fps);
         format.setInteger(MediaFormat.KEY_PRIORITY, 0);   // realtime
         if (MediaFormat.MIMETYPE_VIDEO_HEVC.equals(mime)) {
             // 8-bit 4:2:0 Main: the only shape the OMT HX receiver accepts (no 10-bit, no alpha).

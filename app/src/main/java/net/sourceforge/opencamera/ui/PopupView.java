@@ -68,6 +68,7 @@ public class PopupView extends LinearLayout {
     private int nr_mode_index = -1;
     private int burst_n_images_index = -1;
     private int video_size_index = -1;
+    private int video_fps_index = -1;
     private int video_capture_rate_index = -1;
     private int timer_index = -1;
     private int repeat_mode_index = -1;
@@ -526,6 +527,73 @@ public class PopupView extends LinearLayout {
                             video_size_index++;
                             update();
                             return video_size_index;
+                        }
+                        return -1;
+                    }
+                });
+            }
+
+            // Frame rate sits next to resolution because it also drives the OMT stream, in photo
+            // mode too; before, it was only reachable three levels deep in Settings.
+            final List<Integer> fps_values = main_activity.getSupportedVideoFps();
+            if( !fps_values.isEmpty() && (preview.isVideo() || main_activity.getApplicationInterface().getOmtStreamingEnabled()) ) {
+                final List<String> fps_keys = new ArrayList<>(); // camera fps preference value
+                final List<String> fps_caps = new ArrayList<>(); // OMT HX stream rate, "0" = camera rate
+                final List<String> fps_strings = new ArrayList<>();
+                fps_keys.add("default");
+                fps_caps.add("0");
+                fps_strings.add(getResources().getString(R.string.preference_video_fps_default));
+                for(int fps : fps_values) {
+                    boolean high_speed = preview.fpsIsHighSpeed(String.valueOf(fps));
+                    if( high_speed && !preview.isVideo() )
+                        continue; // high speed sessions only run in video mode
+                    if( high_speed && !fps_values.contains(fps/2) ) {
+                        // e.g. "60 (120 HS)": phones that keep 60 out of normal sessions still stream
+                        // 60 - the camera runs at 120 and the OMT HX encoder keeps every other frame
+                        fps_keys.add(String.valueOf(fps));
+                        fps_caps.add(String.valueOf(fps/2));
+                        fps_strings.add((fps/2) + " (" + fps + " HS)");
+                    }
+                    fps_keys.add(String.valueOf(fps));
+                    fps_caps.add("0");
+                    fps_strings.add(fps + (high_speed ? " HS" : ""));
+                }
+                final String fps_pref_key = PreferenceKeys.getVideoFPSPreferenceKey(preview.getCameraId(), main_activity.getApplicationInterface().getCameraIdSPhysicalPref());
+                String current_fps = main_activity.getApplicationInterface().getVideoFPSPref();
+                String current_cap = sharedPreferences.getString(PreferenceKeys.OmtHxFpsCapKey, "0");
+                int current = fps_keys.indexOf(current_fps);
+                for(int i=0;i<fps_keys.size();i++) {
+                    if( fps_keys.get(i).equals(current_fps) && fps_caps.get(i).equals(current_cap) )
+                        current = i;
+                }
+                video_fps_index = Math.max(current, 0);
+                addArrayOptionsToPopup(fps_strings, "FPS", true, false, video_fps_index, false, "VIDEOFPS", new ArrayOptionsPopupListener() {
+                    private void update() {
+                        String old_fps = main_activity.getApplicationInterface().getVideoFPSPref();
+                        String new_fps = fps_keys.get(video_fps_index);
+                        SharedPreferences.Editor editor = PreferenceManager.getDefaultSharedPreferences(main_activity).edit();
+                        editor.putString(fps_pref_key, new_fps);
+                        editor.putString(PreferenceKeys.OmtHxFpsCapKey, fps_caps.get(video_fps_index));
+                        editor.apply();
+                        // crossing into or out of high speed changes the resolution list, so rebuild the popup then
+                        boolean keep_popup = preview.fpsIsHighSpeed(old_fps) == preview.fpsIsHighSpeed(new_fps);
+                        main_activity.updateForSettings(true, keep_popup ? "" : "FPS: " + fps_strings.get(video_fps_index), keep_popup, false);
+                    }
+                    @Override
+                    public int onClickPrev() {
+                        if( video_fps_index > 0 ) {
+                            video_fps_index--;
+                            update();
+                            return video_fps_index;
+                        }
+                        return -1;
+                    }
+                    @Override
+                    public int onClickNext() {
+                        if( video_fps_index < fps_keys.size() - 1 ) {
+                            video_fps_index++;
+                            update();
+                            return video_fps_index;
                         }
                         return -1;
                     }
